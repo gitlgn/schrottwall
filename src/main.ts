@@ -46,7 +46,8 @@ const T = {
   // Deckung: halb magnetisch. Kreuz loslassen in Reichweite = andocken, Feuer = heraustreten und werfen
   snapRange: 10, // zusätzlich zur halben Deckungsbreite
   slideRange: 80, // im vollen Lauf loslassen: aus dieser Entfernung rutscht die Figur in die Deckung voraus
-  unstick: 0.35, // so lange Richtung halten, um die Deckung zu verlassen
+  slideMinRun: 0.35, // so lange muss sie vorher gelaufen sein, damit Loslassen ein Rutschen auslöst
+  unstick: 0.05, // so lange Richtung halten, um aus der Deckung zu treten (ein kurzer Tipp reicht)
   popOffset: 14, // Abstand neben der Deckungskante beim Heraustreten
   popSpeed: 520,
   rowHold: 0.18, // so lange nur hoch/runter halten, bis die Figur die Reihe wechselt
@@ -383,6 +384,7 @@ function reset() {
   player.hp = T.playerHp;
   player.sinceHit = 99;
   stickHold = 0;
+  stepTo = null;
   pendingThrow = false;
   disc.state = 'held';
   disc.level = 0;
@@ -397,6 +399,7 @@ let padX = 0;
 let padY = 0;
 let fireFlash = 0;
 let moveHold = 0;
+let stepTo: number | null = null; // Ziel des Schritts aus der Deckung heraus
 let spaceHeld = false;
 
 const padCx = 80;
@@ -946,6 +949,7 @@ function tryRowChange(inp: { x: number; y: number }, dt: number) {
   });
   player.vert = want;
   player.toCover = best;
+  stepTo = null;
   player.cover = -1;
   player.slide = false;
   stickHold = 0;
@@ -988,12 +992,20 @@ function update(dt: number) {
   const inp = getInput();
   if (player.vert !== 0) stepRowChange(dt); else tryRowChange(inp, dt);
   if (player.cover >= 0) {
-    // Angedockt: Richtung zielt nur. Erst längeres Halten löst die Figur von der Deckung –
-    // außer die Disc ist unterwegs, dann muss sie schnell zur Fangzone loskommen.
+    // Angedockt: schon ein kurzer Tipp aufs Kreuz tritt aus der Deckung heraus, bis knapp außerhalb
+    // der Andock-Zone. Erst wer weiter hält, läuft los. Herausgetreten zum Werfen zielt das Kreuz nur.
     const out = disc.state !== 'held';
     if (inp.x !== 0 && !pendingThrow && (out || player.pop === 0)) {
       stickHold += dt;
-      if (stickHold > (out ? T.unstickCatch : T.unstick)) { player.cover = -1; stickHold = 0; moveHold = T.playerRamp; }
+      if (stickHold > (out ? T.unstickCatch : T.unstick)) {
+        const c = covers[player.cover];
+        stepTo = clamp(c.x + inp.x * (c.w / 2 + T.snapRange + 8), 16, T.W - 16);
+        player.cover = -1;
+        player.slide = false;
+        stickHold = 0;
+        moveHold = 0;
+        runSpeed = 0;
+      }
     } else {
       stickHold = 0;
     }
@@ -1024,7 +1036,14 @@ function update(dt: number) {
   } else if (player.vert === 0) {
     pendingThrow = false;
     player.pop = 0;
-    if (inp.x !== 0) {
+    if (stepTo !== null) {
+      // Schritt aus der Deckung zu Ende gehen, auch wenn das Kreuz schon losgelassen ist
+      const step = T.popSpeed * dt;
+      runDir = Math.sign(stepTo - player.x) || runDir;
+      if (Math.abs(stepTo - player.x) <= step) { player.x = stepTo; stepTo = null; }
+      else player.x += runDir * step;
+      anim.phase += dt * 15;
+    } else if (inp.x !== 0) {
       moveHold += dt;
       const sp = T.playerSpeedMin + (T.playerSpeed - T.playerSpeedMin) * Math.min(1, moveHold / T.playerRamp);
       player.x = clamp(player.x + inp.x * sp * dt, 16, T.W - 16);
@@ -1036,10 +1055,11 @@ function update(dt: number) {
         particles.push({ x: player.x - runDir * 6, y: bodyY() + 8, vx: -runDir * 30, vy: rand(-10, 10), life: 0.25, max: 0.25, color: '#5b6b85', size: 2.5 });
       }
     } else {
-      moveHold = 0;
       // Magnet: losgelassen in Reichweite einer eigenen Deckung → andocken.
-      // Aus vollem Lauf reicht die größere Rutsch-Reichweite zur Deckung in Laufrichtung.
-      const fast = runSpeed >= T.playerSpeed * 0.9;
+      // Aus vollem Lauf reicht die größere Rutsch-Reichweite zur Deckung in Laufrichtung –
+      // aber nur nach einem echten Anlauf, nicht schon nach einem längeren Tipp.
+      const fast = runSpeed >= T.playerSpeed * 0.9 && moveHold >= T.slideMinRun;
+      moveHold = 0;
       const r = player.row;
       player.cover = covers.findIndex((c) => c.row === r && !c.dead && Math.abs(player.x - c.x) < c.w / 2 + T.snapRange);
       if (player.cover < 0 && fast) {
@@ -1054,8 +1074,8 @@ function update(dt: number) {
       runSpeed = 0;
     }
   }
-  const running = player.cover < 0 && inp.x !== 0;
-  const faceTo = player.vert !== 0 ? rowAngle : player.slide ? runDir * Math.PI / 2 : running ? inp.x * Math.PI / 2 : 0;
+  const running = player.cover < 0 && (inp.x !== 0 || stepTo !== null);
+  const faceTo = player.vert !== 0 ? rowAngle : player.slide || running ? runDir * Math.PI / 2 : 0;
   anim.face += (faceTo - anim.face) * Math.min(1, dt * 16);
   anim.throwT = Math.max(0, anim.throwT - dt);
   player.sinceHit += dt;
@@ -1345,7 +1365,7 @@ function drawSaw(x: number, y: number, r: number, spin: number) {
 // rutschen (gestreckt, Füße voraus), geduckt hinter Deckung, Wurfarm.
 function drawPlayer() {
   const safe = isCovered();
-  const running = player.vert !== 0 || (player.cover < 0 && getInput().x !== 0);
+  const running = player.vert !== 0 || (player.cover < 0 && (getInput().x !== 0 || stepTo !== null));
   const s = running ? Math.sin(anim.phase) : 0;
   const jacket = hurtFlash > 0.5 ? BLOOD_HI : '#2fd0c0';
   ctx.save();
@@ -1807,6 +1827,14 @@ function draw() {
       'Kreuz seitlich halten = Deckung verlassen',
       'Kreuz hoch / runter = Reihe wechseln',
     ];
+    // dunkle Tafel dahinter, damit der Text nicht in den Deckungen untergeht
+    ctx.fillStyle = 'rgba(26,15,28,0.88)';
+    ctx.beginPath();
+    ctx.roundRect(18, hy2 - 72, T.W - 36, lines.length * 21 + 22, 10);
+    ctx.fill();
+    ctx.strokeStyle = '#6d5a78';
+    ctx.lineWidth = 2;
+    ctx.stroke();
     lines.forEach((l, i) => comicText(l, T.W / 2, hy2 - 50 + i * 21, 12.5, '#ffffff'));
   }
   if (gameOver) {

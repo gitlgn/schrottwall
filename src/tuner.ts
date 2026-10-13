@@ -39,7 +39,9 @@ export function initTuner(T: Obj): number {
   if (!wanted || location.search.includes('notune')) return 0;
 
   const defaults = structuredClone(T) as Obj;
-  const paths = numberPaths(T);
+  // einfache Werte zuerst, damit sie unter einer einzigen Überschrift stehen; danach die Tabellen
+  const all = numberPaths(T);
+  const paths = [...all.filter((p) => p.length === 1), ...all.filter((p) => p.length > 1)];
   try {
     const saved = JSON.parse(localStorage.getItem(STORE) ?? '{}') as Record<string, number>;
     for (const p of paths) {
