@@ -62,13 +62,15 @@ function tone(type: OscillatorType, f0: number, f1: number, dur: number, vol: nu
   o.start(t);
   o.stop(t + dur + 0.02);
 }
-function noise(filter: BiquadFilterType, f0: number, f1: number, dur: number, vol: number, at = 0, bus: GainNode = sfxBus) {
+// q > 1 lässt den Filter pfeifen bzw. schmatzen (für nasse Geräusche)
+function noise(filter: BiquadFilterType, f0: number, f1: number, dur: number, vol: number, at = 0, bus: GainNode = sfxBus, q = 1) {
   const t = ctx!.currentTime + at;
   const s = ctx!.createBufferSource();
   s.buffer = noiseBuf;
   s.loop = true;
   const f = ctx!.createBiquadFilter();
   f.type = filter;
+  f.Q.value = q;
   f.frequency.setValueAtTime(f0, t);
   if (f1 !== f0) f.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
   const g = ctx!.createGain();
@@ -83,8 +85,25 @@ function noise(filter: BiquadFilterType, f0: number, f1: number, dur: number, vo
 // p = optionaler Parameter (Stufe der Disc, Kombo, Energie …)
 const SFX: Record<string, (p: number) => void> = {
   // Disc
-  throw: (p) => { noise('bandpass', 900, 3200, 0.14, 0.35); tone('sawtooth', 260 + p * 90, 800 + p * 220, 0.12, 0.12); },
-  bounce: () => { tone('triangle', 1500, 900, 0.05, 0.2); tone('square', 2600, 2000, 0.03, 0.05); },
+  // Wurf: tiefer Schlag beim Loslassen, darüber das Kreischen des Sägeblatts
+  throw: (p) => {
+    tone('sine', 150, 48, 0.2, 0.9);
+    tone('sawtooth', 95 + p * 15, 60, 0.22, 0.4);
+    noise('bandpass', 700, 3400, 0.2, 0.5, 0, sfxBus, 3);
+    tone('sawtooth', 320 + p * 90, 900 + p * 220, 0.16, 0.14);
+  },
+  // Aufprall auf Stein: dumpfer Schlag, trockenes Krachen, kurzes Klirren des Blatts, Bröckeln danach
+  bounce: () => {
+    tone('sine', 100, 38, 0.14, 1);
+    noise('lowpass', 1000, 180, 0.13, 0.9);
+    noise('bandpass', 2200, 1600, 0.035, 0.8, 0, sfxBus, 2);
+    tone('square', 1900, 1500, 0.05, 0.09);
+    noise('highpass', 1400, 2600, 0.2, 0.13, 0.05);
+    for (let i = 0; i < 3; i++) {
+      const f = 500 + Math.random() * 700;
+      tone('triangle', f, f * 0.7, 0.025, 0.14, 0.07 + i * 0.05 + Math.random() * 0.03);
+    }
+  },
   cut: () => { tone('triangle', 1900, 1200, 0.04, 0.14); },
   catch: () => { tone('triangle', 330, 420, 0.07, 0.3); noise('highpass', 3000, 3000, 0.03, 0.12); },
   perfect: (p) => {
@@ -97,11 +116,27 @@ const SFX: Record<string, (p: number) => void> = {
   miss: () => { tone('sawtooth', 190, 55, 0.3, 0.22); noise('lowpass', 500, 120, 0.2, 0.25); },
   pickup: () => { tone('triangle', 220, 340, 0.08, 0.25); },
   // Treffer und Blut
-  hit: () => { noise('lowpass', 1400, 300, 0.08, 0.5); tone('sawtooth', 240, 90, 0.08, 0.2); tone('square', 1700, 1300, 0.03, 0.06); },
+  // Treffer: Säge frisst sich ins Fleisch – Schlag in den Bauch, Sägen, ein Schmatzer
+  hit: () => {
+    tone('sine', 120, 38, 0.16, 1);
+    tone('sawtooth', 180, 70, 0.12, 0.4);
+    noise('bandpass', 2600, 900, 0.1, 0.5, 0, sfxBus, 5);
+    noise('lowpass', 1200, 250, 0.1, 0.5);
+    noise('bandpass', 900, 300, 0.08, 0.4, 0.03, sfxBus, 9);
+  },
+  // Abschuss: nass. Schmatzende Filterfahrten, tiefer Platscher, danach ein paar Tropfen
   kill: (p) => {
-    noise('lowpass', 900, 110, 0.3, 0.7);
-    tone('sine', 190, 45, 0.25, 0.5);
-    tone('square', 300 + p * 80, 600 + p * 120, 0.09, 0.1, 0.03);
+    tone('sine', 170, 36, 0.3, 0.9);
+    noise('lowpass', 1100, 90, 0.4, 0.8);
+    noise('bandpass', 1500, 220, 0.16, 0.9, 0, sfxBus, 10);
+    noise('bandpass', 700, 1800, 0.09, 0.6, 0.07, sfxBus, 12);
+    noise('bandpass', 1300, 260, 0.14, 0.7, 0.13, sfxBus, 10);
+    for (let i = 0; i < 5; i++) {
+      const at = 0.16 + i * 0.045 + Math.random() * 0.03;
+      const f = 240 + Math.random() * 260;
+      tone('sine', f, f * 2.6, 0.035, 0.3, at);
+    }
+    tone('square', 300 + p * 80, 600 + p * 120, 0.09, 0.08, 0.03);
   },
   explode: () => { noise('lowpass', 2400, 60, 0.7, 1); tone('sine', 130, 28, 0.6, 0.9); noise('highpass', 2000, 800, 0.15, 0.3); },
   hurt: () => { tone('sawtooth', 170, 50, 0.22, 0.35); noise('lowpass', 800, 200, 0.15, 0.45); },
