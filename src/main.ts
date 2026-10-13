@@ -1,6 +1,7 @@
 // Schrottwall – Wurf/Fang-Prototyp
 // Eine Arena, eine Disc, ein Gegnertyp. Alles zum Drehen steht in T.
 import { initTuner } from './tuner';
+import { audioMode, cycleAudioMode, setMusicIntensity, sfx, unlockAudio } from './audio';
 
 const T = {
   W: 360, // logische Breite; Höhe ergibt sich aus dem Seitenverhältnis
@@ -221,21 +222,6 @@ let hurtFlash = 0;
 let started = false;
 
 // ---------- Audio ----------
-let actx: AudioContext | null = null;
-function beep(freq: number, dur: number, type: OscillatorType = 'square', vol = 0.08, slideTo?: number) {
-  if (!actx) return;
-  const t = actx.currentTime;
-  const o = actx.createOscillator();
-  const g = actx.createGain();
-  o.type = type;
-  o.frequency.setValueAtTime(freq, t);
-  if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
-  g.gain.setValueAtTime(vol, t);
-  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-  o.connect(g).connect(actx.destination);
-  o.start(t);
-  o.stop(t + dur);
-}
 const buzz = (ms: number) => { try { navigator.vibrate?.(ms); } catch { /* nicht überall erlaubt */ } };
 
 // ---------- Helfer ----------
@@ -321,7 +307,7 @@ function damageCover(i: number, dmg: number) {
   burst(c.x, c.y, '#ff9f3d', 30, 260);
   burst(c.x, c.y, '#8fa3c4', 16, 160);
   shake = Math.max(shake, 7);
-  beep(160, 0.3, 'sawtooth', 0.1, 50);
+  sfx('coverBreak');
   buzz(40);
   if (player.cover === i) { player.cover = -1; player.pop = 0; pendingThrow = false; }
   // Gegner, die dahinter hockten, suchen sich eine neue Stellung
@@ -533,7 +519,7 @@ function fire() {
     if (clash.intro <= 0) {
       clash.energy = Math.min(1, clash.energy + T.clashTap);
       clash.pulse = 1;
-      beep(400 + clash.energy * 500, 0.04, 'square', 0.06);
+      sfx('tap', clash.energy);
       buzz(5);
     }
     return;
@@ -542,10 +528,7 @@ function fire() {
 }
 // true = Eingabe wurde für Start/Neustart verbraucht
 function wake() {
-  if (!actx) {
-    try { actx = new AudioContext(); } catch { /* ohne Ton weiter */ }
-  }
-  actx?.resume();
+  unlockAudio();
   // Zum Abstimmen: mit ?clash in der Adresse startet das Spiel direkt im Nahkampf
   if (!started && location.search.includes('clash')) {
     const p = slotPos(0, false);
@@ -563,8 +546,14 @@ function wake() {
 }
 
 canvas.addEventListener('pointerdown', (e) => {
-  if (wake()) return;
   const p = toLogical(e);
+  // Ton-Knopf zwischen Kreuz und Feuer: alles an → nur Effekte → stumm
+  if (Math.hypot(p.x - T.W / 2, p.y - padCy()) < 24) {
+    unlockAudio();
+    cycleAudioMode();
+    return;
+  }
+  if (wake()) return;
   try { canvas.setPointerCapture(e.pointerId); } catch { /* Capture ist nur Komfort */ }
   if (p.x < T.W / 2) {
     touches.set(e.pointerId, 'pad');
@@ -587,6 +576,7 @@ canvas.addEventListener('pointercancel', release);
 window.addEventListener('keydown', (e) => {
   if (e.target instanceof HTMLInputElement) return; // Tippen in den Reglern steuert nicht das Spiel
   const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+  if (k === 'm') { if (!e.repeat) { unlockAudio(); cycleAudioMode(); } return; }
   if (k === ' ' || k === 'Enter') {
     e.preventDefault();
     if (!e.repeat && !wake()) { spaceHeld = true; fire(); }
@@ -615,7 +605,7 @@ function throwDisc() {
   disc.state = 'fly';
   disc.trail = [];
   anim.throwT = 0.18;
-  beep(300 + disc.level * 120, 0.1, 'sawtooth', 0.05, 900 + disc.level * 200);
+  sfx('throw', disc.level);
   buzz(6);
 }
 
@@ -668,7 +658,7 @@ function land() {
   if (inZone() && !disc.struck) {
     disc.state = 'held';
     catchFlash = 0.4;
-    beep(330, 0.06, 'triangle', 0.09);
+    sfx('catch');
     buzz(6);
   } else if (inZone()) {
     disc.state = 'held';
@@ -680,8 +670,7 @@ function land() {
     shake = Math.max(shake, 4);
     burst(player.x, handY(), LEVEL_COLORS[disc.level], 18, 240);
     floatText(player.x, player.y - 44, streak > 1 ? `PERFEKT x${streak}` : 'PERFEKT', LEVEL_COLORS[disc.level], 18);
-    beep(660, 0.07, 'square', 0.09);
-    setTimeout(() => beep(990 + disc.level * 110, 0.12, 'square', 0.09), 50);
+    sfx('perfect', disc.level);
     buzz(20);
   } else {
     disc.state = 'down';
@@ -691,7 +680,7 @@ function land() {
     streak = 0;
     floatText(disc.x, disc.y - 20, 'DANEBEN', '#ff5a5a', 14);
     burst(disc.x, disc.y, '#ff5a5a', 8, 110);
-    beep(140, 0.2, 'sawtooth', 0.08, 60);
+    sfx('miss');
     buzz(30);
   }
 }
@@ -716,7 +705,7 @@ function explode(en: Enemy) {
   burst(en.x, en.y, '#ffd23f', 18, 220);
   shake = Math.max(shake, 12);
   freeze = T.hitStop;
-  beep(90, 0.35, 'sawtooth', 0.14, 35);
+  sfx('explode');
   buzz(70);
   for (const o of enemies) {
     if (o === en || o.dead || Math.hypot(o.x - en.x, o.y - en.y) > T.bomberBlastR) continue;
@@ -741,12 +730,12 @@ function hitEnemy(en: Enemy) {
     disc.combo++;
     killEnemy(en, T.kinds[en.kind].score * disc.combo);
     shake = Math.max(shake, 4 + Math.min(disc.combo, 5));
-    beep(180 + disc.combo * 70, 0.12, 'square', 0.07, 80);
+    sfx('kill', disc.combo);
     buzz(12);
   } else {
     burst(disc.x, disc.y, color, 4, 140);
     gore(disc.x, disc.y, 1);
-    beep(520, 0.04, 'square', 0.05);
+    sfx('hit');
     // Treffer drückt den Gegner zurück in die Deckung – Panzer lassen sich davon nicht stören
     if (en.kind !== 'tank' && (en.state === 'out' || en.state === 'aim')) en.state = 'back';
   }
@@ -757,7 +746,7 @@ function startClash(en: Enemy) {
   padX = 0;
   padY = 0;
   shake = 10;
-  beep(120, 0.4, 'sawtooth', 0.12, 480);
+  sfx('clashStart');
   buzz(80);
 }
 function updateClash(dt: number) {
@@ -770,7 +759,7 @@ function updateClash(dt: number) {
   if (c.energy <= 0) {
     clash = null;
     player.hp = 0;
-    beep(110, 0.5, 'sawtooth', 0.14, 40);
+    sfx('lose');
     buzz(200);
     endGame();
   } else if (c.t >= T.clashTime) {
@@ -787,8 +776,7 @@ function updateClash(dt: number) {
     pendingThrow = false;
     clash = null;
     shake = 8;
-    beep(523, 0.1, 'square', 0.09);
-    setTimeout(() => beep(784, 0.2, 'square', 0.09), 110);
+    sfx('win');
     buzz(40);
   }
 }
@@ -800,7 +788,7 @@ function hurtPlayer(dmg: number) {
   hurtFlash = 1;
   shake = Math.max(shake, 8);
   gore(player.x, bodyY(), 2);
-  beep(110, 0.2, 'sawtooth', 0.12, 50);
+  sfx('hurt');
   buzz(50);
   if (player.hp <= 0) {
     player.hp = 0;
@@ -817,11 +805,13 @@ function hurtBoss(dmg: number) {
   burst(disc.x, disc.y, LEVEL_COLORS[disc.level], 8, 240);
   gore(disc.x, disc.y, 2 + dmg);
   floatText(b.x, b.y + T.bossR + 18, `-${dmg}`, '#ffd9a0', 18);
-  beep(140, 0.18, 'square', 0.1, 70);
+  sfx('bossHurt');
   buzz(25);
   if (b.hp > 0) return;
   gore(b.x, b.y, 12);
   gibs(b.x, b.y, '#b9a27c', 30);
+  sfx('explode');
+  sfx('win');
   score += T.bossScore;
   boss = null;
   bullets = [];
@@ -842,7 +832,7 @@ function updateBoss(dt: number) {
       const a = base + T.bossFanSpread * ((i / (T.bossFanCount - 1)) * 2 - 1);
       bullets.push({ x: b.x, y: b.y + T.bossR * 0.5, vx: Math.cos(a) * T.bossFanSpeed, vy: Math.sin(a) * T.bossFanSpeed, dmg: T.bossFanDmg, cover: 1, r: 4.5 });
     }
-    beep(260, 0.15, 'square', 0.08, 120);
+    sfx('bossFan');
   }
 }
 
@@ -908,7 +898,7 @@ function stepDisc(dt: number) {
   if (bounced) {
     disc.pts.push({ x: disc.x, y: disc.y });
     burst(disc.x, disc.y, LEVEL_COLORS[disc.level], 4, 90);
-    beep(700, 0.03, 'triangle', 0.04);
+    sfx('bounce');
   }
 
   if (boss && Math.hypot(disc.x - boss.x, disc.y - boss.y) < T.bossR + T.discR) {
@@ -925,7 +915,7 @@ function stepDisc(dt: number) {
       disc.state = 'boss';
       disc.trail = [];
       boss.holdT = T.bossHold;
-      beep(200, 0.12, 'square', 0.08, 400);
+      sfx('bossCatch');
     }
     return;
   }
@@ -987,7 +977,7 @@ function updateEnemy(en: Enemy, dt: number) {
         en.state = 'charge';
         en.timer = T.chargeTime;
         en.vault = 0;
-        beep(300, 0.15, 'sawtooth', 0.07, 600);
+        sfx('alert');
       }
     } else {
       en.vault = 0;
@@ -1023,9 +1013,9 @@ function updateEnemy(en: Enemy, dt: number) {
       if (en.timer <= 0) {
         const a = Math.atan2(bodyY() - en.y, player.x - en.x) + rand(-k.spread, k.spread);
         bullets.push({ x: en.x, y: en.y, vx: Math.cos(a) * k.shotSpeed, vy: Math.sin(a) * k.shotSpeed, dmg: k.shotDmg, cover: k.coverDmg, r: k.shotR });
-        if (en.kind === 'tank') { beep(140, 0.18, 'square', 0.09, 60); shake = Math.max(shake, 3); }
-        else if (en.kind === 'sniper') beep(1400, 0.12, 'sawtooth', 0.07, 300);
-        else beep(420, 0.07, 'square', 0.05, 160);
+        if (en.kind === 'tank') { sfx('shotTank'); shake = Math.max(shake, 3); }
+        else if (en.kind === 'sniper') sfx('shotSniper');
+        else sfx('shot');
         en.shots--;
         if (en.shots > 0) en.timer = k.gap; else en.state = 'back';
       }
@@ -1070,7 +1060,7 @@ function tryRowChange(inp: { x: number; y: number }, dt: number) {
   player.cover = -1;
   player.slide = false;
   stickHold = 0;
-  beep(200, 0.2, 'sawtooth', 0.035, 320);
+  sfx('sprint');
 }
 function stepRowChange(dt: number) {
   // ohne heile Deckung in der Zielreihe geht es gerade hinüber ins Offene
@@ -1089,7 +1079,7 @@ function stepRowChange(dt: number) {
     player.cover = c && !c.dead ? player.toCover : -1;
     player.slide = false;
     shake = Math.max(shake, 2.5);
-    beep(90, 0.07, 'square', 0.08);
+    sfx('thud');
     buzz(12);
     return;
   }
@@ -1142,7 +1132,7 @@ function update(dt: number) {
       if (player.x === tx) {
         player.slide = false;
         shake = Math.max(shake, 2.5);
-        beep(90, 0.07, 'square', 0.08);
+        sfx('thud');
         buzz(12);
       }
     }
@@ -1186,7 +1176,7 @@ function update(dt: number) {
       if (player.cover >= 0 && fast) {
         player.slide = true;
         runDir = Math.sign(covers[player.cover].x - player.x) || runDir;
-        beep(260, 0.28, 'sawtooth', 0.04, 70);
+        sfx('slide');
       }
       runSpeed = 0;
     }
@@ -1232,8 +1222,7 @@ function update(dt: number) {
     waveBreak = T.waveBreak;
     player.hp = Math.min(T.playerHp, player.hp + T.waveHeal);
     floatText(T.W / 2, playerY() - 70, `Level ${wave} geschafft  +${bonus}`, '#5dff8f', 16);
-    beep(523, 0.1, 'square', 0.08);
-    setTimeout(() => beep(784, 0.18, 'square', 0.08), 110);
+    sfx('levelDone');
   }
 
   // Kugeln
@@ -1244,20 +1233,21 @@ function update(dt: number) {
     const ci = coverAt(b.x, b.y, 2);
     if (ci >= 0) {
       burst(b.x, b.y, '#8fa3c4', 4 + b.cover, 80 + b.cover * 15);
+      sfx('coverHit');
       damageCover(ci, b.cover);
       return false;
     }
     // Die fliegende Disc schneidet Kugeln weg
     if (disc.state !== 'held' && Math.hypot(b.x - disc.x, b.y - disc.y) < T.discR + 6) {
       burst(b.x, b.y, '#ffb04a', 6, 120);
-      beep(900, 0.03, 'triangle', 0.05);
+      sfx('cut');
       return false;
     }
     if (Math.hypot(b.x - player.x, b.y - hitY) < 12) {
       if (isCovered()) {
         // Deckung fängt auch Schüsse ab, die schräg darunter durchkämen
         burst(b.x, covers[player.cover].y, '#ff9f3d', 5, 110);
-        beep(1200, 0.02, 'triangle', 0.03);
+        sfx('coverHit');
         damageCover(player.cover, b.cover);
       } else {
         hurtPlayer(b.dmg);
@@ -1279,7 +1269,7 @@ function update(dt: number) {
         // er wirft sie weit weg von der Figur, jedes Mal schneller
         disc.retSpeed = Math.min(T.bossThrowMax, T.bossThrowSpeed + T.bossThrowGain * boss.throws++);
         disc.state = 'return';
-        beep(500, 0.15, 'sawtooth', 0.08, 180);
+        sfx('bossThrow');
       }
     }
   } else if (disc.state === 'down') {
@@ -1287,7 +1277,7 @@ function update(dt: number) {
     if (player.vert === 0 && player.row === disc.zone.row && Math.abs(player.x - disc.x) < T.pickupR) {
       disc.state = 'held';
       catchFlash = 0.3;
-      beep(220, 0.05, 'triangle', 0.08);
+      sfx('pickup');
     }
   } else if (disc.state !== 'held') {
     disc.trail.push({ x: disc.x, y: disc.y });
@@ -1619,6 +1609,40 @@ function drawControls() {
   ctx.arc(fireCx, cy, r - 8, Math.PI * 1.1, Math.PI * 1.6);
   ctx.stroke();
   comicText('FEUER', fireCx, cy + 6, 16, ready ? '#ffffff' : '#b9a6c2');
+
+  // Ton-Knopf: Lautsprecher mit Wellen (alles), ohne Wellen (nur Effekte), durchgestrichen (stumm)
+  const mx = T.W / 2;
+  const am = audioMode();
+  ctx.beginPath();
+  ctx.arc(mx, cy, 17, 0, Math.PI * 2);
+  ctx.fillStyle = '#5b4a66';
+  ctx.fill();
+  inkStroke(2.5);
+  ctx.fillStyle = am === 2 ? '#8a7896' : '#ffffff';
+  ctx.beginPath();
+  ctx.moveTo(mx - 9, cy - 3);
+  ctx.lineTo(mx - 5, cy - 3);
+  ctx.lineTo(mx, cy - 8);
+  ctx.lineTo(mx, cy + 8);
+  ctx.lineTo(mx - 5, cy + 3);
+  ctx.lineTo(mx - 9, cy + 3);
+  ctx.closePath();
+  ctx.fill();
+  ctx.strokeStyle = ctx.fillStyle;
+  ctx.lineWidth = 2;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  if (am === 0) {
+    ctx.arc(mx + 1, cy, 5, -0.9, 0.9);
+    ctx.moveTo(mx + 1 + Math.cos(-0.9) * 9, cy + Math.sin(-0.9) * 9);
+    ctx.arc(mx + 1, cy, 9, -0.9, 0.9);
+  } else if (am === 2) {
+    ctx.strokeStyle = BLOOD_HI;
+    ctx.lineWidth = 3;
+    ctx.moveTo(mx - 9, cy + 9);
+    ctx.lineTo(mx + 9, cy - 9);
+  }
+  ctx.stroke();
 }
 
 // Eigener Bildschirm für den Nahkampf. Platzhalter-Grafik, die richtige Animation kommt später.
@@ -1988,6 +2012,8 @@ function frame(now: number) {
   last = now;
   if (freeze > 0) freeze -= dt;
   else if (!gameOver && started) { if (clash) updateClash(dt); else update(dt); }
+  // Musik folgt der Lage: Pause und Game Over ruhig, Kampf voll, Boss und Nahkampf am dichtesten
+  setMusicIntensity(!started || gameOver ? 0 : clash || boss ? 2 : waveBreak > 0 ? 0 : 1);
   updateFx(dt);
   draw();
   requestAnimationFrame(frame);
