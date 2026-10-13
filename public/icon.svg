@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <rect width="512" height="512" fill="#2a1626"/>
+  <!-- Blutfleck -->
+  <g fill="#b3122a">
+    <circle cx="256" cy="268" r="168"/>
+    <circle cx="96" cy="170" r="34"/>
+    <circle cx="420" cy="150" r="26"/>
+    <circle cx="430" cy="380" r="38"/>
+    <circle cx="90" cy="390" r="24"/>
+    <circle cx="256" cy="462" r="22"/>
+  </g>
+  <!-- Sägeblatt -->
+  <g stroke="#1a0f1c" stroke-width="16" stroke-linejoin="round">
+    <polygon fill="#dfe6ee" points="256,96 289,136 337,116 346,167 397,172 380,221 424,248 386,283 410,329 360,340 357,392 308,376 280,420 244,382 199,409 189,358 138,352 156,303 112,275 151,241 127,194 178,184 181,132 230,149"/>
+    <circle cx="256" cy="258" r="72" fill="#ffd23f"/>
+    <circle cx="256" cy="258" r="20" fill="#1a0f1c"/>
+  </g>
+</svg>
