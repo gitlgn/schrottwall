@@ -54,15 +54,25 @@ const T = {
   sprintSpeed: 420,
   rowSlide: 60, // die letzten Pixel vor der Deckung rutscht sie
 
-  enemyR: 16,
-  enemyHp: 3,
-  enemyWalk: 70,
-  enemyPeek: 95,
-  hideMin: 0.6,
-  hideMax: 1.6,
-  aimTime: 0.5, // Vorwarnzeit vor dem Schuss
-  burstMin: 5, // Schüsse pro Salve
-  burstMax: 8,
+  enemyR: 16, // Grundmaß für die Stellungen an den Deckungen
+  // Gegnertypen. r = Größe, walk/peek = Lauf- und Heraustret-Tempo, hide = Zeit in Deckung,
+  // aim = Vorwarnzeit, burst = Schüsse pro Salve, gap = Abstand zwischen den Schüssen,
+  // shot* = Tempo/Schaden/Größe der Kugel, coverDmg = Schaden an zerstörbarer Deckung.
+  kinds: {
+    // Standard: hockt in Deckung, tritt heraus, feuert Salven
+    grunt: { r: 16, hp: 3, walk: 70, peek: 95, hideMin: 0.6, hideMax: 1.6, aim: 0.5, burstMin: 5, burstMax: 8, gap: 0.13, spread: 0.1, shotSpeed: 260, shotDmg: 9, coverDmg: 1, shotR: 4.5, score: 10 },
+    // Selbstzerstörer: rennt ohne Deckung auf die Figur zu und explodiert (ab Level 4)
+    bomber: { r: 13, hp: 2, walk: 105, peek: 0, hideMin: 0, hideMax: 0, aim: 0, burstMin: 0, burstMax: 0, gap: 0, spread: 0, shotSpeed: 0, shotDmg: 0, coverDmg: 0, shotR: 0, score: 15 },
+    // Panzer: wenige, zäh, langsame schwere Schüsse, die Deckung schnell zerlegen (ab Level 7)
+    tank: { r: 21, hp: 10, walk: 45, peek: 60, hideMin: 1.4, hideMax: 2.6, aim: 0.9, burstMin: 2, burstMax: 3, gap: 0.45, spread: 0.04, shotSpeed: 200, shotDmg: 25, coverDmg: 6, shotR: 8, score: 40 },
+    // Scharfschütze: bleibt ganz hinten, zielt lange und sichtbar, ein schneller harter Schuss (ab Level 11)
+    sniper: { r: 13, hp: 2, walk: 70, peek: 110, hideMin: 2, hideMax: 3.5, aim: 1.3, burstMin: 1, burstMax: 1, gap: 0.2, spread: 0, shotSpeed: 560, shotDmg: 35, coverDmg: 4, shotR: 3.5, score: 30 },
+  },
+  bomberBlastR: 62, // Explosionsradius: trifft die Figur und andere Gegner
+  bomberDmg: 30,
+  bomberEnemyDmg: 3,
+  bomberCoverDmg: 12, // wenn die Deckung die Explosion abfängt
+  bomberMax: 2, // gleichzeitig unterwegs
 
   // Nahkampf: Gegner an derselben Deckung springt nach kurzer Zeit herüber; Berührung startet das Minispiel
   vaultDelay: 1.5,
@@ -91,17 +101,15 @@ const T = {
   bossFanWarn: 0.5,
   bossFanCount: 7,
   bossFanSpread: 0.5,
+  bossFanSpeed: 260,
+  bossFanDmg: 9,
+  bossHpPerTier: 6, // jeder weitere Boss (Level 20, 30 …) hält so viel mehr aus
   bossScore: 300,
-  burstGap: 0.13,
-  bulletSpread: 0.1,
-  bulletSpeed: 260,
-  bulletDmg: 9,
   maxAimers: 3, // so viele Gegner dürfen gleichzeitig aus der Deckung
   lanes: [127, 233], // freie Laufgassen zwischen den Deckungen
   spawnGap: 1.8,
 
-  waveBase: 3, // Gegner pro Welle = waveBase + Wellennummer
-  maxConcurrent: 5,
+  maxConcurrent: 5, // Gegner gleichzeitig in Deckungen (Selbstzerstörer zählen extra)
   waveBreak: 2.5,
   waveHeal: 30,
 
@@ -113,23 +121,27 @@ const LEVEL_COLORS = ['#ffffff', '#3fd4ff', '#ffd23f', '#ff4fa3'];
 type DiscState = 'held' | 'fly' | 'return' | 'down' | 'boss'; // down = liegt am Boden, boss = der Boss hält sie
 type ZoneKind = keyof typeof T.catchZone;
 type EnemyState = 'move' | 'hide' | 'out' | 'aim' | 'back' | 'charge';
+type EnemyKind = keyof typeof T.kinds;
 // x/y = Mitte. weight > 0 = Gegner nutzen sie (von oben), row >= 0 = Spieler nutzt sie (von unten) in dieser Reihe.
 // maxHp 0 = unzerstörbar; dead = zerschossen, bis zur nächsten Welle weg.
 interface Cover { x: number; y: number; w: number; h: number; weight: number; row: number; hp: number; maxHp: number; dead: boolean }
 interface Boss {
-  x: number; y: number; hp: number; tx: number; moveT: number;
+  x: number; y: number; hp: number; maxHp: number; tx: number; moveT: number;
   fanT: number; holdT: number; throws: number; flash: number;
 }
 interface Slot { cover: number; side: number; taken: boolean }
 interface Enemy {
+  kind: EnemyKind;
+  dead: boolean; // Abschuss schon verbucht (verhindert doppelte Explosionen und Punkte)
   x: number; y: number; hp: number; maxHp: number; hitCd: number; flash: number;
-  slot: number; state: EnemyState; timer: number; shots: number; cycles: number;
+  slot: number; // Stellung an einer Deckung, -1 = keine (Selbstzerstörer)
+  state: EnemyState; timer: number; shots: number; cycles: number;
   path: { x: number; y: number }[];
   vault: number; // Zeit, die er schon an der Deckung des Spielers hockt
 }
 // Nahkampf-Minispiel: energy sinkt, Feuer-Tipps füllen auf; t = durchgehaltene Zeit
 interface Clash { enemy: Enemy; energy: number; t: number; intro: number; pulse: number }
-interface Bullet { x: number; y: number; vx: number; vy: number }
+interface Bullet { x: number; y: number; vx: number; vy: number; dmg: number; cover: number; r: number }
 interface Particle { x: number; y: number; vx: number; vy: number; life: number; max: number; color: string; size: number }
 interface FloatText { x: number; y: number; text: string; life: number; color: string; size: number }
 
@@ -193,7 +205,9 @@ let score = 0;
 let streak = 0;
 let bestStreak = 0;
 let wave = 0;
-let toSpawn = 0;
+let spawnQueue: EnemyKind[] = []; // was in diesem Level noch kommt
+// Testseite: ?level=7 startet direkt in diesem Level
+const startLevel = Math.max(1, Number(new URLSearchParams(location.search).get('level')) || 1);
 let waveBreak = 1.5;
 let record = 0;
 try { record = Number(localStorage.getItem('schrottwall.record')) || 0; } catch { /* privates Fenster */ }
@@ -278,8 +292,10 @@ function slotPos(slot: number, peek: boolean) {
     y: c.y - c.h / 2 - T.enemyR - 3,
   };
 }
-function pickSlot() {
-  const free = slots.map((s, i) => ({ s, i })).filter((o) => !o.s.taken && !covers[o.s.cover].dead);
+// minWeight 3 = nur die hintersten Deckungen (Scharfschützen)
+function pickSlot(minWeight = 0) {
+  const free = slots.map((s, i) => ({ s, i }))
+    .filter((o) => !o.s.taken && !covers[o.s.cover].dead && covers[o.s.cover].weight >= minWeight);
   let total = 0;
   for (const o of free) total += covers[o.s.cover].weight;
   let r = Math.random() * total;
@@ -310,7 +326,7 @@ function damageCover(i: number, dmg: number) {
   if (player.cover === i) { player.cover = -1; player.pop = 0; pendingThrow = false; }
   // Gegner, die dahinter hockten, suchen sich eine neue Stellung
   for (const en of enemies) {
-    if (slots[en.slot].cover !== i || en.state === 'charge') continue;
+    if (en.slot < 0 || slots[en.slot].cover !== i || en.state === 'charge') continue;
     const next = pickSlot();
     if (next < 0) continue;
     slots[en.slot].taken = false;
@@ -332,16 +348,76 @@ function buildPath(fx: number, fy: number, tx: number, ty: number) {
 function nearestLane(fx: number, tx: number) {
   return T.lanes.reduce((a, b) => (Math.abs(fx - a) + Math.abs(tx - a) <= Math.abs(fx - b) + Math.abs(tx - b) ? a : b));
 }
-const hideTime = () => rand(T.hideMin, T.hideMax) * Math.max(0.5, 1 - (wave - 1) * 0.06);
+const hideTime = (en: Enemy) =>
+  rand(T.kinds[en.kind].hideMin, T.kinds[en.kind].hideMax) * Math.max(0.5, 1 - (wave - 1) * 0.04);
+
+// Levelaufbau in Zehnerblöcken; jeder Block bringt höchstens einen neuen Gegnertyp:
+//   1–3   nur Standardgegner, jedes Level einer mehr
+//   4–6   dazu Selbstzerstörer
+//   7–9   dazu Panzer (wenige), ein paar Selbstzerstörer bleiben
+//   10    Boss
+//   11–13 wie 1–3, dazu Scharfschützen;  14–16 dazu Selbstzerstörer;  17–19 dazu Panzer;  20 Boss
+//   danach wiederholt sich das Muster, jede Zehnerstufe (tier) mit mehr Gegnern und mehr Leben.
+function levelPlan(n: number) {
+  const tier = Math.floor((n - 1) / 10);
+  const pos = (n - 1) % 10;
+  if (pos === 9) return { boss: true, tier, kinds: Array<EnemyKind>(tier * 2).fill('grunt') };
+  const block = Math.floor(pos / 3);
+  const s = pos % 3;
+  const c: Record<EnemyKind, number> = { grunt: 4 + s + tier, bomber: 0, tank: 0, sniper: 0 };
+  if (block === 1) c.bomber = 2 + s + tier;
+  if (block === 2) {
+    c.grunt -= 1;
+    c.tank = 1 + (s > 0 ? 1 : 0) + tier;
+    c.bomber = s + tier;
+  }
+  if (tier >= 1) c.sniper = tier + (s > 0 ? 1 : 0);
+  const kinds: EnemyKind[] = [];
+  for (const k of Object.keys(c) as EnemyKind[]) for (let i = 0; i < c[k]; i++) kinds.push(k);
+  // mischen, damit die Typen durcheinander kommen
+  for (let i = kinds.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [kinds[i], kinds[j]] = [kinds[j], kinds[i]];
+  }
+  return { boss: false, tier, kinds };
+}
+const NEW_AT: Record<number, string> = { 4: 'Neu: Selbstzerstörer', 7: 'Neu: Panzer', 11: 'Neu: Scharfschützen' };
 
 function startWave(n: number) {
   wave = n;
-  toSpawn = T.waveBase + n;
+  const plan = levelPlan(n);
+  spawnQueue = plan.kinds;
   spawnTimer = 0.4;
   restoreCovers();
+  if (plan.boss) spawnBoss(T.bossHp + plan.tier * T.bossHpPerTier);
+  if (NEW_AT[n]) floatText(T.W / 2, T.topY + 90, NEW_AT[n], '#ffd23f', 18);
 }
-function spawnBoss() {
-  boss = { x: T.W / 2, y: T.topY + 52, hp: T.bossHp, tx: T.W / 2, moveT: 1, fanT: T.bossFanGap, holdT: 0, throws: 0, flash: 0 };
+function spawnBoss(hp = T.bossHp) {
+  boss = { x: T.W / 2, y: T.topY + 52, hp, maxHp: hp, tx: T.W / 2, moveT: 1, fanT: T.bossFanGap, holdT: 0, throws: 0, flash: 0 };
+}
+function spawnEnemy(kind: EnemyKind): boolean {
+  const k = T.kinds[kind];
+  const tier = Math.floor((wave - 1) / 10);
+  const hp = k.hp + (kind === 'tank' ? tier * 3 : tier);
+  const y = T.topY + T.enemyR + 2;
+  const base = { kind, dead: false, hp, maxHp: hp, hitCd: 0, flash: 0, timer: 0, shots: 0, cycles: 0, vault: 0 };
+  if (kind === 'bomber') {
+    // läuft eine Gasse herunter bis hinter die mittlere Deckung, dann direkt auf die Figur zu
+    if (enemies.filter((e) => e.kind === 'bomber').length >= T.bomberMax) return false;
+    const lane = T.lanes[Math.floor(Math.random() * T.lanes.length)];
+    enemies.push({ ...base, x: lane, y, slot: -1, state: 'move', path: [{ x: lane, y: covers[2].y + 34 }] });
+    return true;
+  }
+  const maxEnemies = Math.min(T.maxConcurrent, 2 + Math.floor(wave / 2));
+  if (enemies.filter((e) => e.kind !== 'bomber').length >= maxEnemies) return false;
+  let slot = kind === 'sniper' ? pickSlot(3) : pickSlot();
+  if (slot < 0 && kind === 'sniper') slot = pickSlot();
+  if (slot < 0) return false;
+  slots[slot].taken = true;
+  const to = slotPos(slot, false);
+  const lane = nearestLane(to.x, to.x);
+  enemies.push({ ...base, x: lane, y, slot, state: 'move', path: [{ x: lane, y: to.y }, to] });
+  return true;
 }
 function endGame() {
   gameOver = true;
@@ -361,8 +437,8 @@ function reset() {
   for (const s of slots) s.taken = false;
   score = 0;
   streak = 0;
-  wave = 0;
-  toSpawn = 0;
+  wave = startLevel - 1;
+  spawnQueue = [];
   waveBreak = bossMode ? 0 : 1.5;
   gameOver = false;
   won = false;
@@ -473,7 +549,7 @@ function wake() {
   // Zum Abstimmen: mit ?clash in der Adresse startet das Spiel direkt im Nahkampf
   if (!started && location.search.includes('clash')) {
     const p = slotPos(0, false);
-    const en: Enemy = { x: p.x, y: p.y, hp: 1, maxHp: 1, hitCd: 0, flash: 0, slot: 0, state: 'hide', timer: 9, shots: 0, cycles: 0, path: [], vault: 0 };
+    const en: Enemy = { kind: 'grunt', dead: false, x: p.x, y: p.y, hp: 1, maxHp: 1, hitCd: 0, flash: 0, slot: 0, state: 'hide', timer: 9, shots: 0, cycles: 0, path: [], vault: 0 };
     slots[0].taken = true;
     enemies.push(en);
     startClash(en);
@@ -620,6 +696,41 @@ function land() {
   }
 }
 
+const KIND_COLOR: Record<EnemyKind, string> = { grunt: '#e0364a', bomber: '#4a4458', tank: '#7a5ad0', sniper: '#3fb86b' };
+
+// Abschuss verbuchen: Stellung freigeben, Punkte, Blut. Selbstzerstörer explodieren dabei.
+function killEnemy(en: Enemy, pts: number) {
+  if (en.dead) return;
+  en.dead = true;
+  en.hp = 0;
+  if (en.slot >= 0) slots[en.slot].taken = false;
+  score += pts;
+  gore(en.x, en.y, en.kind === 'tank' ? 7 : 4);
+  gibs(en.x, en.y, KIND_COLOR[en.kind], en.kind === 'tank' ? 16 : 9);
+  if (pts > 0) floatText(en.x, en.y - 6, `+${pts}`, '#ffd9a0', 13 + Math.min(disc.combo, 6));
+  if (en.kind === 'bomber') explode(en);
+}
+// Explosion des Selbstzerstörers: trifft die Figur und alle Gegner im Radius, auch andere Selbstzerstörer
+function explode(en: Enemy) {
+  burst(en.x, en.y, '#ff8a1f', 34, 340);
+  burst(en.x, en.y, '#ffd23f', 18, 220);
+  shake = Math.max(shake, 12);
+  freeze = T.hitStop;
+  beep(90, 0.35, 'sawtooth', 0.14, 35);
+  buzz(70);
+  for (const o of enemies) {
+    if (o === en || o.dead || Math.hypot(o.x - en.x, o.y - en.y) > T.bomberBlastR) continue;
+    o.hp -= T.bomberEnemyDmg;
+    o.flash = 1;
+    if (o.hp <= 0) killEnemy(o, T.kinds[o.kind].score);
+  }
+  if (Math.hypot(player.x - en.x, bodyY() - en.y) <= T.bomberBlastR) {
+    // geduckt und der Gegner noch vor der Deckung: sie fängt die Explosion ab
+    if (isCovered() && en.y < covers[player.cover].y) damageCover(player.cover, T.bomberCoverDmg);
+    else hurtPlayer(T.bomberDmg);
+  }
+}
+
 function hitEnemy(en: Enemy) {
   const dmg = T.levels[disc.level].dmg;
   en.hp -= dmg;
@@ -627,13 +738,8 @@ function hitEnemy(en: Enemy) {
   en.hitCd = 0.12;
   const color = LEVEL_COLORS[disc.level];
   if (en.hp <= 0) {
-    slots[en.slot].taken = false;
     disc.combo++;
-    const pts = 10 * disc.combo;
-    score += pts;
-    gore(en.x, en.y, 4);
-    gibs(en.x, en.y, '#e0364a', 9);
-    floatText(en.x, en.y - 6, `+${pts}`, '#ffd9a0', 13 + Math.min(disc.combo, 6));
+    killEnemy(en, T.kinds[en.kind].score * disc.combo);
     shake = Math.max(shake, 4 + Math.min(disc.combo, 5));
     beep(180 + disc.combo * 70, 0.12, 'square', 0.07, 80);
     buzz(12);
@@ -641,8 +747,8 @@ function hitEnemy(en: Enemy) {
     burst(disc.x, disc.y, color, 4, 140);
     gore(disc.x, disc.y, 1);
     beep(520, 0.04, 'square', 0.05);
-    // Treffer drückt den Gegner zurück in die Deckung
-    if (en.state === 'out' || en.state === 'aim') en.state = 'back';
+    // Treffer drückt den Gegner zurück in die Deckung – Panzer lassen sich davon nicht stören
+    if (en.kind !== 'tank' && (en.state === 'out' || en.state === 'aim')) en.state = 'back';
   }
 }
 
@@ -670,11 +776,9 @@ function updateClash(dt: number) {
   } else if (c.t >= T.clashTime) {
     // Durchgehalten: der Gegner zählt als besiegt, weiter im normalen Spiel
     const en = c.enemy;
-    en.hp = 0;
-    slots[en.slot].taken = false;
+    killEnemy(en, 0);
     enemies = enemies.filter((o) => o !== en);
     score += T.clashScore;
-    burst(en.x, en.y, '#ff6a3d', 26, 280);
     floatText(player.x, player.y - 44, `NAHKAMPF GEWONNEN  +${T.clashScore}`, '#5dff8f', 15);
     bullets = [];
     invuln = 1.5;
@@ -736,7 +840,7 @@ function updateBoss(dt: number) {
     const base = Math.atan2(bodyY() - b.y, player.x - b.x);
     for (let i = 0; i < T.bossFanCount; i++) {
       const a = base + T.bossFanSpread * ((i / (T.bossFanCount - 1)) * 2 - 1);
-      bullets.push({ x: b.x, y: b.y + T.bossR * 0.5, vx: Math.cos(a) * T.bulletSpeed, vy: Math.sin(a) * T.bulletSpeed });
+      bullets.push({ x: b.x, y: b.y + T.bossR * 0.5, vx: Math.cos(a) * T.bossFanSpeed, vy: Math.sin(a) * T.bossFanSpeed, dmg: T.bossFanDmg, cover: 1, r: 4.5 });
     }
     beep(260, 0.15, 'square', 0.08, 120);
   }
@@ -782,7 +886,7 @@ function hitEnemies() {
   let n = 0;
   for (const en of enemies) {
     if (en.hp <= 0 || en.hitCd > 0) continue;
-    if (Math.hypot(disc.x - en.x, disc.y - en.y) >= T.enemyR + T.discR) continue;
+    if (Math.hypot(disc.x - en.x, disc.y - en.y) >= T.kinds[en.kind].r + T.discR) continue;
     lastHit = { x: en.x, y: en.y };
     hitEnemy(en);
     n++;
@@ -863,10 +967,20 @@ function walkTo(en: Enemy, tx: number, ty: number, speed: number, dt: number) {
 function updateEnemy(en: Enemy, dt: number) {
   en.hitCd -= dt;
   en.flash = Math.max(0, en.flash - dt * 6);
+  const k = T.kinds[en.kind];
+  if (en.kind === 'bomber') {
+    // erst die Gasse herunter, dann geradewegs auf die Figur zu, zum Schluss schneller
+    if (en.path.length > 0) {
+      if (walkTo(en, en.path[0].x, en.path[0].y, k.walk, dt)) en.path.shift();
+    } else {
+      walkTo(en, player.x, bodyY(), k.walk * 1.25, dt);
+    }
+    return;
+  }
   const hide = slotPos(en.slot, false);
   const peek = slotPos(en.slot, true);
-  // Hockt der Spieler an derselben Deckung, springt der Gegner nach kurzer Zeit herüber
-  if (en.state !== 'move' && en.state !== 'charge') {
+  // Hockt der Spieler an derselben Deckung, springt ein Standardgegner nach kurzer Zeit herüber
+  if (en.kind === 'grunt' && en.state !== 'move' && en.state !== 'charge') {
     if (player.vert === 0 && player.cover === slots[en.slot].cover) {
       en.vault += dt;
       if (en.vault > T.vaultDelay) {
@@ -889,9 +1003,9 @@ function updateEnemy(en: Enemy, dt: number) {
       }
       break;
     case 'move':
-      if (walkTo(en, en.path[0].x, en.path[0].y, T.enemyWalk, dt)) {
+      if (walkTo(en, en.path[0].x, en.path[0].y, k.walk, dt)) {
         en.path.shift();
-        if (en.path.length === 0) { en.state = 'hide'; en.timer = hideTime(); }
+        if (en.path.length === 0) { en.state = 'hide'; en.timer = hideTime(en); }
       }
       break;
     case 'hide':
@@ -902,22 +1016,25 @@ function updateEnemy(en: Enemy, dt: number) {
       }
       break;
     case 'out':
-      if (walkTo(en, peek.x, peek.y, T.enemyPeek, dt)) { en.state = 'aim'; en.timer = T.aimTime; en.shots = Math.floor(rand(T.burstMin, T.burstMax + 1)); }
+      if (walkTo(en, peek.x, peek.y, k.peek, dt)) { en.state = 'aim'; en.timer = k.aim; en.shots = Math.floor(rand(k.burstMin, k.burstMax + 1)); }
       break;
     case 'aim':
       en.timer -= dt;
       if (en.timer <= 0) {
-        const a = Math.atan2(bodyY() - en.y, player.x - en.x) + rand(-T.bulletSpread, T.bulletSpread);
-        bullets.push({ x: en.x, y: en.y, vx: Math.cos(a) * T.bulletSpeed, vy: Math.sin(a) * T.bulletSpeed });
-        beep(420, 0.07, 'square', 0.05, 160);
+        const a = Math.atan2(bodyY() - en.y, player.x - en.x) + rand(-k.spread, k.spread);
+        bullets.push({ x: en.x, y: en.y, vx: Math.cos(a) * k.shotSpeed, vy: Math.sin(a) * k.shotSpeed, dmg: k.shotDmg, cover: k.coverDmg, r: k.shotR });
+        if (en.kind === 'tank') { beep(140, 0.18, 'square', 0.09, 60); shake = Math.max(shake, 3); }
+        else if (en.kind === 'sniper') beep(1400, 0.12, 'sawtooth', 0.07, 300);
+        else beep(420, 0.07, 'square', 0.05, 160);
         en.shots--;
-        if (en.shots > 0) en.timer = T.burstGap; else en.state = 'back';
+        if (en.shots > 0) en.timer = k.gap; else en.state = 'back';
       }
       break;
     case 'back':
-      if (walkTo(en, hide.x, hide.y, T.enemyPeek, dt)) {
+      if (walkTo(en, hide.x, hide.y, k.peek, dt)) {
         en.cycles++;
-        const next = en.cycles >= 2 && Math.random() < 0.5 ? pickSlot() : -1;
+        // Stellungswechsel machen nur Standardgegner; Panzer und Scharfschützen bleiben, wo sie sind
+        const next = en.kind === 'grunt' && en.cycles >= 2 && Math.random() < 0.5 ? pickSlot() : -1;
         if (next >= 0) {
           // Stellungswechsel: offen quer übers Feld
           slots[en.slot].taken = false;
@@ -929,7 +1046,7 @@ function updateEnemy(en: Enemy, dt: number) {
           en.state = 'move';
         } else {
           en.state = 'hide';
-          en.timer = hideTime();
+          en.timer = hideTime(en);
         }
       }
       break;
@@ -1089,40 +1206,32 @@ function update(dt: number) {
     if (waveBreak <= 0) startWave(wave + 1);
   } else {
     spawnTimer -= dt;
-    const maxEnemies = Math.min(T.maxConcurrent, 2 + Math.floor(wave / 2));
-    if (toSpawn > 0 && spawnTimer <= 0 && enemies.length < maxEnemies) {
-      const slot = pickSlot();
-      if (slot >= 0) {
-        slots[slot].taken = true;
-        const hp = T.enemyHp + Math.floor((wave - 1) / 3);
-        const to = slotPos(slot, false);
-        const lane = nearestLane(to.x, to.x);
-        const y = T.topY + T.enemyR + 2;
-        enemies.push({
-          x: lane, y, hp, maxHp: hp, hitCd: 0, flash: 0,
-          slot, state: 'move', timer: 0, shots: 0, cycles: 0,
-          path: [{ x: lane, y: to.y }, to],
-          vault: 0,
-        });
-        toSpawn--;
+    if (spawnQueue.length > 0 && spawnTimer <= 0) {
+      // den ersten Typ aus der Warteschlange nehmen, für den gerade Platz ist
+      const i = spawnQueue.findIndex((kind) => spawnEnemy(kind));
+      if (i >= 0) {
+        spawnQueue.splice(i, 1);
         spawnTimer = T.spawnGap;
       }
     }
   }
   for (const en of enemies) updateEnemy(en, dt);
-  enemies = enemies.filter((en) => en.hp > 0);
   if (boss) updateBoss(dt);
   invuln = Math.max(0, invuln - dt);
-  if (invuln <= 0) {
-    const hit = enemies.find((en) => Math.hypot(en.x - player.x, en.y - bodyY()) < T.enemyR + 10);
-    if (hit) { startClash(hit); return; }
+  // Berührung: Selbstzerstörer explodieren, alle anderen gehen in den Nahkampf
+  for (const en of enemies) {
+    if (en.dead || Math.hypot(en.x - player.x, en.y - bodyY()) >= T.kinds[en.kind].r + 10) continue;
+    if (en.kind === 'bomber') { killEnemy(en, 0); continue; }
+    if (invuln <= 0) { startClash(en); return; }
   }
-  if (waveBreak <= 0 && wave > 0 && toSpawn === 0 && enemies.length === 0) {
+  enemies = enemies.filter((en) => en.hp > 0 && !en.dead);
+  if (gameOver) return;
+  if (waveBreak <= 0 && wave > 0 && spawnQueue.length === 0 && enemies.length === 0 && !boss && !bossMode) {
     const bonus = 50 * wave;
     score += bonus;
     waveBreak = T.waveBreak;
     player.hp = Math.min(T.playerHp, player.hp + T.waveHeal);
-    floatText(T.W / 2, playerY() - 70, `Welle ${wave} geschafft  +${bonus}`, '#5dff8f', 16);
+    floatText(T.W / 2, playerY() - 70, `Level ${wave} geschafft  +${bonus}`, '#5dff8f', 16);
     beep(523, 0.1, 'square', 0.08);
     setTimeout(() => beep(784, 0.18, 'square', 0.08), 110);
   }
@@ -1134,8 +1243,8 @@ function update(dt: number) {
     b.y += b.vy * dt;
     const ci = coverAt(b.x, b.y, 2);
     if (ci >= 0) {
-      burst(b.x, b.y, '#8fa3c4', 4, 80);
-      damageCover(ci, 1);
+      burst(b.x, b.y, '#8fa3c4', 4 + b.cover, 80 + b.cover * 15);
+      damageCover(ci, b.cover);
       return false;
     }
     // Die fliegende Disc schneidet Kugeln weg
@@ -1149,9 +1258,9 @@ function update(dt: number) {
         // Deckung fängt auch Schüsse ab, die schräg darunter durchkämen
         burst(b.x, covers[player.cover].y, '#ff9f3d', 5, 110);
         beep(1200, 0.02, 'triangle', 0.03);
-        damageCover(player.cover, 1);
+        damageCover(player.cover, b.cover);
       } else {
-        hurtPlayer(T.bulletDmg);
+        hurtPlayer(b.dmg);
       }
       return false;
     }
@@ -1668,8 +1777,8 @@ function draw() {
   for (const en of enemies) {
     if (en.state === 'aim') {
       // Vorwarnung: Ziellinie wird bis zum Schuss kräftiger
-      ctx.strokeStyle = `rgba(226,32,58,${0.2 + 0.6 * (1 - clamp(en.timer / T.aimTime, 0, 1))})`;
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = `rgba(226,32,58,${0.2 + 0.6 * (1 - clamp(en.timer / T.kinds[en.kind].aim, 0, 1))})`;
+      ctx.lineWidth = en.kind === 'sniper' ? 3 : en.kind === 'tank' ? 2.5 : 1.5;
       ctx.beginPath();
       ctx.moveTo(en.x, en.y);
       ctx.lineTo(player.x, bodyY());
@@ -1677,9 +1786,14 @@ function draw() {
     }
     // Orange = setzt zum Nahkampf an bzw. stürmt
     const rush = en.state === 'charge' || en.vault > 0;
-    drawDemon(en.x, en.y, T.enemyR, en.flash > 0 ? '#ffffff' : rush ? '#ff8a1f' : '#e0364a', '#ffd23f');
-    if (rush) comicText('!', en.x, en.y - T.enemyR - 14, 20, '#ffd23f');
-    hpBar(en.x, en.y - T.enemyR - 9, 28, 3, en.hp / en.maxHp, BLOOD_HI);
+    const er = T.kinds[en.kind].r;
+    // Selbstzerstörer blinken, je näher an der Figur desto schneller
+    const near = Math.hypot(en.x - player.x, en.y - bodyY());
+    const blink = en.kind === 'bomber' && Math.floor(performance.now() / (near < 140 ? 70 : 180)) % 2 === 0;
+    const body = en.flash > 0 ? '#ffffff' : rush || blink ? '#ff8a1f' : KIND_COLOR[en.kind];
+    drawDemon(en.x, en.y, er, body, en.kind === 'sniper' ? BLOOD_HI : '#ffd23f', en.kind === 'tank' ? 1.4 : en.kind === 'sniper' ? 0.5 : 1);
+    if (rush) comicText('!', en.x, en.y - er - 14, 20, '#ffd23f');
+    hpBar(en.x, en.y - er - 9, er * 1.75, 3, en.hp / en.maxHp, BLOOD_HI);
   }
 
   // Boss: Höllenritter
@@ -1695,19 +1809,19 @@ function draw() {
       ctx.stroke();
     }
     drawDemon(b.x, b.y, T.bossR, b.flash > 0 ? '#ffffff' : warn ? '#e8c46a' : '#b9a27c', BLOOD_HI, 1.6);
-    hpBar(T.W / 2, T.topY + 8, 220, 7, b.hp / T.bossHp, BLOOD_HI);
+    hpBar(T.W / 2, T.topY + 8, 220, 7, b.hp / b.maxHp, BLOOD_HI);
   }
 
   // Kugeln: Feuerbälle
   for (const b of bullets) {
     ctx.fillStyle = '#ff5a1f';
     ctx.beginPath();
-    ctx.arc(b.x, b.y, 4.5, 0, Math.PI * 2);
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
     ctx.fill();
-    inkStroke(1.5);
-    ctx.fillStyle = '#ffd23f';
+    inkStroke(b.r > 6 ? 2.5 : 1.5);
+    ctx.fillStyle = b.r < 4 ? '#ffffff' : '#ffd23f';
     ctx.beginPath();
-    ctx.arc(b.x, b.y, 2, 0, Math.PI * 2);
+    ctx.arc(b.x, b.y, b.r * 0.45, 0, Math.PI * 2);
     ctx.fill();
   }
 
@@ -1808,13 +1922,13 @@ function draw() {
   // HUD
   comicText(String(score), 12, 31, 19, '#ffffff', 'left');
   comicText(`Serie ${streak} · Best ${bestStreak}`, T.W - 12, 29, 12, streak > 0 ? LEVEL_COLORS[disc.level] : '#b9a6c2', 'right');
-  if (wave > 0 || bossMode) comicText(bossMode ? 'Boss-Test' : `Welle ${wave}`, T.W / 2, 29, 13, '#ffd23f');
+  if (wave > 0 || bossMode) comicText(bossMode ? 'Boss-Test' : `Level ${Math.max(wave, startLevel)}`, T.W / 2, 29, 13, '#ffd23f');
   if (bossMode && started && !gameOver && disc.level === 0 && disc.state === 'held') {
     comicText('Werfen → er schleudert sie weg → in der Zone fangen', T.W / 2, floorY() + 8, 11, '#d9c9e2');
   }
   if (started && !gameOver && waveBreak > 0) {
     ctx.globalAlpha = clamp(waveBreak * 2, 0, 1);
-    comicText(`WELLE ${wave + 1}`, T.W / 2, T.topY + (playerY() - T.topY) * 0.5, 34, '#ffd23f');
+    comicText((wave + 1) % 10 === 0 ? 'BOSS' : `LEVEL ${wave + 1}`, T.W / 2, T.topY + (playerY() - T.topY) * 0.5, 34, '#ffd23f');
     ctx.globalAlpha = 1;
   }
   if (!started) {
@@ -1841,7 +1955,7 @@ function draw() {
     ctx.fillStyle = 'rgba(26,15,28,0.8)';
     ctx.fillRect(0, 0, T.W, H);
     comicText(won ? 'BOSS BESIEGT' : 'GEFALLEN', T.W / 2, H / 2 - 34, 32, won ? '#5dff8f' : BLOOD_HI);
-    comicText(bossMode ? `Punkte ${score}` : `Welle ${wave} · Punkte ${score}`, T.W / 2, H / 2 + 4, 17, '#ffffff');
+    comicText(bossMode ? `Punkte ${score}` : `Level ${wave} · Punkte ${score}`, T.W / 2, H / 2 + 4, 17, '#ffffff');
     const rec = score >= record && score > 0;
     comicText(rec ? 'Neuer Rekord!' : `Rekord ${record}`, T.W / 2, H / 2 + 30, 14, rec ? '#ffd23f' : '#b9a6c2');
     comicText('Tippen für Neustart', T.W / 2, H / 2 + 62, 14, '#ffffff');
