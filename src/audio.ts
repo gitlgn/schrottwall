@@ -157,6 +157,24 @@ const SFX: Record<string, (p: number) => void> = {
   win: () => { [523, 659, 784, 1047].forEach((f, i) => tone('square', f, f, 0.16, 0.18, i * 0.09)); },
   lose: () => { tone('sawtooth', 220, 36, 0.9, 0.4); noise('lowpass', 600, 60, 0.9, 0.5); },
   levelDone: () => { [523, 784, 1047].forEach((f, i) => tone('triangle', f, f, 0.2, 0.26, i * 0.1)); },
+  // Höllentor: tiefes Grollen, aufsteigendes Rauschen, Knistern
+  portal: () => {
+    tone('sawtooth', 55, 90, 0.6, 0.35);
+    tone('sine', 70, 40, 0.6, 0.5);
+    noise('bandpass', 300, 1800, 0.55, 0.4, 0, sfxBus, 4);
+    for (let i = 0; i < 4; i++) noise('highpass', 4000, 4000, 0.03, 0.2, 0.1 + i * 0.1 + Math.random() * 0.05);
+  },
+  // Hitze
+  overheat: () => { noise('highpass', 3000, 1500, 0.9, 0.35); tone('sawtooth', 400, 150, 0.25, 0.15); },
+  cooled: () => { tone('triangle', 1200, 1600, 0.08, 0.14); },
+  // Beute und Reparatur
+  coin: () => { tone('square', 1320, 1320, 0.05, 0.12); tone('square', 1760, 1760, 0.12, 0.12, 0.05); },
+  heart: () => { tone('triangle', 523, 784, 0.18, 0.3); tone('sine', 1046, 1046, 0.2, 0.15, 0.08); },
+  brick: () => { tone('sine', 140, 80, 0.1, 0.6); noise('lowpass', 900, 300, 0.08, 0.4); tone('triangle', 880, 880, 0.08, 0.15, 0.04); },
+  hammer: () => { tone('sine', 260, 120, 0.06, 0.5); noise('bandpass', 2500, 1800, 0.04, 0.4, 0, sfxBus, 3); },
+  repaired: () => { [392, 523, 659].forEach((f, i) => tone('triangle', f, f, 0.14, 0.24, i * 0.07)); },
+  cancel: () => { tone('square', 300, 180, 0.1, 0.12); },
+  unlock: () => { [440, 660, 880].forEach((f, i) => tone('square', f, f, 0.1, 0.13, i * 0.06)); },
   // Boss
   bossCatch: () => { tone('square', 180, 420, 0.14, 0.22); noise('bandpass', 600, 1500, 0.1, 0.2); },
   bossThrow: () => { tone('sawtooth', 520, 150, 0.2, 0.25); noise('bandpass', 2500, 700, 0.2, 0.3); },

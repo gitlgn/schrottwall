@@ -115,6 +115,41 @@ const T = {
   waveHeal: 30,
 
   hitStop: 0.07,
+
+  // Beute: fällt beim Abschuss auf die nächste Reihe vor dem Gegner. Hinlaufen oder mit der Disc einsammeln.
+  coinChance: 0.7,
+  coinsPer: { grunt: 1, bomber: 1, tank: 3, sniper: 2, boss: 10 },
+  heartChance: 0.1,
+  heal: 25,
+  brickChance: 0.22,
+  maxBricks: 5,
+  dropLife: 9, // Sekunden, bis Beute verschwindet (die letzten zwei blinkt sie)
+  // Reparatur: ein Ziegel stellt diesen Anteil der Deckung wieder her, auch eine zerschossene
+  brickRepair: 0.5,
+  repairTime: 2,
+
+  checkpointEvery: 5, // Level 1, 6, 11 … werden beim Erreichen als Startpunkt freigeschaltet
+
+  // Hitze: jeder Wurf heizt die Säge auf, sie kühlt in der Hand schneller ab als im Flug.
+  // Bei voller Hitze kurze Zwangspause. Später über Upgrades verbesserbar.
+  heatPerThrow: 0.25,
+  heatCoolHeld: 0.4, // pro Sekunde
+  heatCoolFly: 0.12,
+  overheatTime: 1.8,
+
+  // Wer zu lange ungedeckt steht, wird gezielt beschossen
+  exposedAfter: 2, // Sekunden im Freien
+  exposedAimMul: 0.5, // kürzere Vorwarnung …
+  exposedHideMul: 0.4, // … kürzere Pausen in Deckung …
+  exposedExtraAimers: 2, // … und mehr Gegner gleichzeitig draußen
+
+  // Seitentore: ab diesem Level kommen manche Gegner aus den Seitenwänden statt von oben
+  sideGateFrom: 11,
+  sideGateChance: 0.4,
+
+  // Höllentor vor jedem Gegner: so lange steigt er heraus, danach schließt es sich
+  portalTime: 0.7,
+  portalClose: 0.35,
 };
 
 const LEVEL_COLORS = ['#ffffff', '#3fd4ff', '#ffd23f', '#ff4fa3'];
@@ -139,6 +174,7 @@ interface Enemy {
   state: EnemyState; timer: number; shots: number; cycles: number;
   path: { x: number; y: number }[];
   vault: number; // Zeit, die er schon an der Deckung des Spielers hockt
+  spawnT: number; // > 0: steigt noch aus dem Höllentor, weder aktiv noch verwundbar
 }
 // Nahkampf-Minispiel: energy sinkt, Feuer-Tipps füllen auf; t = durchgehaltene Zeit
 interface Clash { enemy: Enemy; energy: number; t: number; intro: number; pulse: number }
@@ -194,6 +230,8 @@ const disc = {
   retSpeed: 0,
   pts: [] as { x: number; y: number }[], // Abprallpunkte für die Kette
   trail: [] as { x: number; y: number }[],
+  heat: 0, // 0..1
+  overheat: 0, // Restzeit der Zwangspause
 };
 let covers: Cover[] = [];
 let slots: Slot[] = [];
@@ -212,6 +250,30 @@ const startLevel = Math.max(1, Number(new URLSearchParams(location.search).get('
 let waveBreak = 1.5;
 let record = 0;
 try { record = Number(localStorage.getItem('schrottwall.record')) || 0; } catch { /* privates Fenster */ }
+
+// Dauerhaft gespeichert: Münzen (für spätere Upgrades) und der höchste freigeschaltete Checkpoint
+const loadNum = (key: string, def: number) => { try { return Number(localStorage.getItem(key)) || def; } catch { return def; } };
+const saveNum = (key: string, v: number) => { try { localStorage.setItem(key, String(v)); } catch { /* privates Fenster */ } };
+let coins = loadNum('schrottwall.coins', 0);
+let checkpoint = loadNum('schrottwall.checkpoint', 1);
+let bricks = 0; // nur für die laufende Runde
+
+type DropKind = 'coin' | 'heart' | 'brick';
+interface Drop { kind: DropKind; x: number; y: number; ty: number; vy: number; row: number; life: number }
+let drops: Drop[] = [];
+// Höllentore, aus denen Gegner steigen (age = Sekunden seit dem Öffnen)
+interface Portal { x: number; y: number; age: number }
+let portals: Portal[] = [];
+// laufende Reparatur: Deckung, Fortschritt, Takt für die Hammerschläge
+let repair: { cover: number; t: number; tick: number } | null = null;
+
+// Levelübersicht vor dem Start – außer auf den Testseiten (?level, ?boss, ?clash)
+const testStart = /[?&](level|boss|clash|repair)/.test(location.search);
+// Testseite: ?repair startet mit vollen Ziegeln, beschädigter und zerschossener Deckung und Beute am Boden
+const repairTest = location.search.includes('repair');
+let runStart = startLevel;
+interface MenuCard { x: number; y: number; w: number; h: number; level: number; open: boolean }
+let menuCards: MenuCard[] = [];
 let spawnTimer = 1;
 let gameOver = false;
 let gameOverAt = 0;
@@ -334,8 +396,11 @@ function buildPath(fx: number, fy: number, tx: number, ty: number) {
 function nearestLane(fx: number, tx: number) {
   return T.lanes.reduce((a, b) => (Math.abs(fx - a) + Math.abs(tx - a) <= Math.abs(fx - b) + Math.abs(tx - b) ? a : b));
 }
+let exposedT = 0; // wie lange die Figur schon ungedeckt steht
+const playerExposed = () => exposedT > T.exposedAfter;
 const hideTime = (en: Enemy) =>
-  rand(T.kinds[en.kind].hideMin, T.kinds[en.kind].hideMax) * Math.max(0.5, 1 - (wave - 1) * 0.04);
+  rand(T.kinds[en.kind].hideMin, T.kinds[en.kind].hideMax) * Math.max(0.5, 1 - (wave - 1) * 0.04)
+  * (playerExposed() ? T.exposedHideMul : 1);
 
 // Levelaufbau in Zehnerblöcken; jeder Block bringt höchstens einen neuen Gegnertyp:
 //   1–3   nur Standardgegner, jedes Level einer mehr
@@ -376,7 +441,32 @@ function startWave(n: number) {
   spawnTimer = 0.4;
   restoreCovers();
   if (plan.boss) spawnBoss(T.bossHp + plan.tier * T.bossHpPerTier);
+  if (repairTest && n === runStart) setupRepairTest();
   if (NEW_AT[n]) floatText(T.W / 2, T.topY + 90, NEW_AT[n], '#ffd23f', 18);
+  if (!testStart && (n - 1) % T.checkpointEvery === 0 && n > checkpoint) {
+    checkpoint = n;
+    saveNum('schrottwall.checkpoint', checkpoint);
+    floatText(T.W / 2, T.topY + 120, `Checkpoint ${n} freigeschaltet`, '#5dff8f', 16);
+    sfx('unlock');
+  }
+}
+function setupRepairTest() {
+  bricks = T.maxBricks - 1; // einer Platz für den Ziegel am Boden
+  covers.forEach((c) => {
+    if (c.maxHp === 0) return;
+    if (c.row === 0 && c.x > T.W / 2) c.dead = true; // rechte Deckung vorne: zerschossen
+    else c.hp = c.maxHp * (c.row === 0 ? 0.3 : 0.5); // die anderen angeschlagen
+  });
+  // Beute direkt neben der Figur zum Aufheben
+  const kinds: DropKind[] = ['brick', 'coin', 'heart', 'coin'];
+  kinds.forEach((kind, i) => {
+    const x = T.W / 2 - 30 + i * 22;
+    drops.push({ kind, x, y: rowY(0) + 10, ty: rowY(0) + 10, vy: 0, row: 0, life: 60 });
+  });
+}
+function openPortal(x: number, y: number) {
+  portals.push({ x, y, age: 0 });
+  sfx('portal');
 }
 function spawnBoss(hp = T.bossHp) {
   boss = { x: T.W / 2, y: T.topY + 52, hp, maxHp: hp, tx: T.W / 2, moveT: 1, fanT: T.bossFanGap, holdT: 0, throws: 0, flash: 0 };
@@ -386,11 +476,12 @@ function spawnEnemy(kind: EnemyKind): boolean {
   const tier = Math.floor((wave - 1) / 10);
   const hp = k.hp + (kind === 'tank' ? tier * 3 : tier);
   const y = T.topY + T.enemyR + 2;
-  const base = { kind, dead: false, hp, maxHp: hp, hitCd: 0, flash: 0, timer: 0, shots: 0, cycles: 0, vault: 0 };
+  const base = { kind, dead: false, hp, maxHp: hp, hitCd: 0, flash: 0, timer: 0, shots: 0, cycles: 0, vault: 0, spawnT: T.portalTime };
   if (kind === 'bomber') {
     // läuft eine Gasse herunter bis hinter die mittlere Deckung, dann direkt auf die Figur zu
     if (enemies.filter((e) => e.kind === 'bomber').length >= T.bomberMax) return false;
     const lane = T.lanes[Math.floor(Math.random() * T.lanes.length)];
+    openPortal(lane, y);
     enemies.push({ ...base, x: lane, y, slot: -1, state: 'move', path: [{ x: lane, y: covers[2].y + 34 }] });
     return true;
   }
@@ -401,8 +492,19 @@ function spawnEnemy(kind: EnemyKind): boolean {
   if (slot < 0) return false;
   slots[slot].taken = true;
   const to = slotPos(slot, false);
-  const lane = nearestLane(to.x, to.x);
-  enemies.push({ ...base, x: lane, y, slot, state: 'move', path: [{ x: lane, y: to.y }, to] });
+  const c = covers[slots[slot].cover];
+  if (wave >= T.sideGateFrom && c.weight < 3 && Math.random() < T.sideGateChance) {
+    // Seitentor: kommt auf Höhe seiner Stellung aus der nächsten Wand
+    const side = to.x < T.W / 2 ? -1 : 1;
+    const gx = side < 0 ? -k.r : T.W + k.r;
+    openPortal(clamp(gx, 14, T.W - 14), to.y);
+    enemies.push({ ...base, x: clamp(gx, 14, T.W - 14), y: to.y, slot, state: 'move', path: [to] });
+    return true;
+  }
+  // senkrecht von oben in der eigenen Spalte: die Zieldeckung liegt den ganzen Weg zwischen
+  // ihm und der Figur, ein gerader Wurf von unten erwischt ihn beim Anmarsch nicht mehr
+  openPortal(to.x, y);
+  enemies.push({ ...base, x: to.x, y, slot, state: 'move', path: [to] });
   return true;
 }
 function endGame() {
@@ -420,12 +522,16 @@ function reset() {
   particles = [];
   texts = [];
   decals = [];
+  portals = [];
   for (const s of slots) s.taken = false;
   score = 0;
   streak = 0;
-  wave = startLevel - 1;
+  wave = runStart - 1;
+  drops = [];
+  bricks = 0;
+  repair = null;
   spawnQueue = [];
-  waveBreak = bossMode ? 0 : 1.5;
+  waveBreak = bossMode ? 0 : repairTest ? 0.2 : 1.5;
   gameOver = false;
   won = false;
   restoreCovers();
@@ -451,6 +557,9 @@ function reset() {
   disc.state = 'held';
   disc.level = 0;
   disc.trail = [];
+  disc.heat = 0;
+  disc.overheat = 0;
+  exposedT = 0;
 }
 
 // ---------- Eingabe ----------
@@ -502,7 +611,7 @@ const isCovered = () =>
 
 // Aus der Deckung erst heraustreten (zur Zielseite, sonst zur Feldmitte), dann werfen
 function requestThrow() {
-  if (disc.state !== 'held' || pendingThrow || player.vert !== 0) return;
+  if (disc.state !== 'held' || pendingThrow || player.vert !== 0 || disc.overheat > 0) return;
   if (player.cover >= 0 && player.pop === 0) {
     player.pop = getInput().x || (covers[player.cover].x < T.W / 2 ? 1 : -1);
     player.slide = false;
@@ -524,15 +633,38 @@ function fire() {
     }
     return;
   }
+  cancelRepair(); // Werfen bricht die Reparatur ab
   requestThrow();
 }
+function startRun(level: number) {
+  runStart = level;
+  reset();
+  started = true;
+  sfx('unlock');
+}
+// Tipp auf eine Karte der Levelübersicht: nur freigeschaltete Checkpoints lassen sich starten
+function menuTap(p: { x: number; y: number }) {
+  const card = menuCards.find((c) => p.x >= c.x && p.x <= c.x + c.w && p.y >= c.y && p.y <= c.y + c.h);
+  if (!card) return;
+  if (card.open) startRun(card.level);
+  else sfx('cancel');
+}
+// Ton- und Reparatur-Knopf liegen zwischen Kreuz und Feuer; der Abbrechen-Knopf am Reparatur-Fenster
+const soundBtn = () => ({ x: T.W / 2, y: padCy() + 44, r: 16 });
+const repairBtn = () => ({ x: T.W / 2, y: padCy() - 22, r: 24 });
+const repairPopup = () => ({ x: T.W / 2 - 100, y: H - T.ctrlH - 50, w: 200, h: 38 });
+
 // true = Eingabe wurde für Start/Neustart verbraucht
-function wake() {
+function wake(p?: { x: number; y: number }) {
   unlockAudio();
+  if (!started && !testStart) {
+    if (p) menuTap(p); else startRun(checkpoint);
+    return true;
+  }
   // Zum Abstimmen: mit ?clash in der Adresse startet das Spiel direkt im Nahkampf
   if (!started && location.search.includes('clash')) {
     const p = slotPos(0, false);
-    const en: Enemy = { kind: 'grunt', dead: false, x: p.x, y: p.y, hp: 1, maxHp: 1, hitCd: 0, flash: 0, slot: 0, state: 'hide', timer: 9, shots: 0, cycles: 0, path: [], vault: 0 };
+    const en: Enemy = { kind: 'grunt', dead: false, x: p.x, y: p.y, hp: 1, maxHp: 1, hitCd: 0, flash: 0, slot: 0, state: 'hide', timer: 9, shots: 0, cycles: 0, path: [], vault: 0, spawnT: 0 };
     slots[0].taken = true;
     enemies.push(en);
     startClash(en);
@@ -541,19 +673,35 @@ function wake() {
   }
   started = true;
   if (!gameOver) return false;
-  if (performance.now() - gameOverAt > 700) reset();
+  if (performance.now() - gameOverAt > 700) {
+    // zurück zur Levelübersicht; auf den Testseiten direkt neu
+    if (testStart) reset(); else { started = false; reset(); }
+  }
   return true;
 }
 
 canvas.addEventListener('pointerdown', (e) => {
   const p = toLogical(e);
-  // Ton-Knopf zwischen Kreuz und Feuer: alles an → nur Effekte → stumm
-  if (Math.hypot(p.x - T.W / 2, p.y - padCy()) < 24) {
+  // Ton-Knopf: alles an → nur Effekte → stumm
+  const sb = soundBtn();
+  if (Math.hypot(p.x - sb.x, p.y - sb.y) < sb.r + 6) {
     unlockAudio();
     cycleAudioMode();
     return;
   }
-  if (wake()) return;
+  if (started && !gameOver) {
+    const rb = repairBtn();
+    if (Math.hypot(p.x - rb.x, p.y - rb.y) < rb.r + 4) {
+      if (repair) cancelRepair(); else startRepair();
+      return;
+    }
+    const pp = repairPopup();
+    if (repair && p.x >= pp.x && p.x <= pp.x + pp.w && p.y >= pp.y && p.y <= pp.y + pp.h) {
+      cancelRepair();
+      return;
+    }
+  }
+  if (wake(p)) return;
   try { canvas.setPointerCapture(e.pointerId); } catch { /* Capture ist nur Komfort */ }
   if (p.x < T.W / 2) {
     touches.set(e.pointerId, 'pad');
@@ -577,6 +725,7 @@ window.addEventListener('keydown', (e) => {
   if (e.target instanceof HTMLInputElement) return; // Tippen in den Reglern steuert nicht das Spiel
   const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
   if (k === 'm') { if (!e.repeat) { unlockAudio(); cycleAudioMode(); } return; }
+  if (k === 'r') { if (!e.repeat) { if (repair) cancelRepair(); else startRepair(); } return; }
   if (k === ' ' || k === 'Enter') {
     e.preventDefault();
     if (!e.repeat && !wake()) { spaceHeld = true; fire(); }
@@ -605,6 +754,14 @@ function throwDisc() {
   disc.state = 'fly';
   disc.trail = [];
   anim.throwT = 0.18;
+  disc.heat += T.heatPerThrow;
+  if (disc.heat >= 1) {
+    // überhitzt: dieser Wurf geht noch, danach muss die Säge abkühlen
+    disc.heat = 1;
+    disc.overheat = T.overheatTime;
+    floatText(player.x, player.y - 44, 'ÜBERHITZT', '#ff8a1f', 15);
+    sfx('overheat');
+  }
   sfx('throw', disc.level);
   buzz(6);
 }
@@ -697,7 +854,105 @@ function killEnemy(en: Enemy, pts: number) {
   gore(en.x, en.y, en.kind === 'tank' ? 7 : 4);
   gibs(en.x, en.y, KIND_COLOR[en.kind], en.kind === 'tank' ? 16 : 9);
   if (pts > 0) floatText(en.x, en.y - 6, `+${pts}`, '#ffd9a0', 13 + Math.min(disc.combo, 6));
+  spawnDrops(en.x, en.y, en.kind);
   if (en.kind === 'bomber') explode(en);
+}
+
+// ---------- Beute und Reparatur ----------
+function spawnDrops(x: number, y: number, from: EnemyKind | 'boss') {
+  // landet auf der nächsten Reihe vor dem Gegner: weit vorne getötet = Vorrücken lohnt sich
+  const row = y < row1Y - 10 ? 1 : 0;
+  const add = (kind: DropKind) => {
+    drops.push({ kind, x: clamp(x + rand(-14, 14), 14, T.W - 14), y, ty: rowY(row) + 10, vy: rand(-160, -60), row, life: T.dropLife });
+  };
+  const n = from === 'boss' || Math.random() < T.coinChance ? T.coinsPer[from] : 0;
+  for (let i = 0; i < n; i++) add('coin');
+  if (from === 'boss' || Math.random() < T.heartChance) add('heart');
+  if (Math.random() < T.brickChance) add('brick');
+}
+function collect(d: Drop) {
+  if (d.kind === 'brick') {
+    if (bricks >= T.maxBricks) return false;
+    bricks++;
+    floatText(d.x, d.ty - 26, 'Ziegel', '#e3aa5c', 13);
+    sfx('brick');
+  } else if (d.kind === 'heart') {
+    player.hp = Math.min(T.playerHp, player.hp + T.heal);
+    floatText(d.x, d.ty - 26, `+${T.heal}`, '#5dff8f', 14);
+    sfx('heart');
+  } else {
+    coins++;
+    saveNum('schrottwall.coins', coins);
+    sfx('coin');
+  }
+  burst(d.x, d.ty, d.kind === 'coin' ? '#ffd23f' : d.kind === 'heart' ? BLOOD_HI : '#c98a3c', 6, 90);
+  return true;
+}
+function updateDrops(dt: number) {
+  for (const d of drops) {
+    // fällt mit Schwerkraft auf die Reihe und hüpft einmal nach
+    if (d.y < d.ty || d.vy < 0) {
+      d.vy += 900 * dt;
+      d.y += d.vy * dt;
+      if (d.y >= d.ty) { d.y = d.ty; d.vy = d.vy > 140 ? -d.vy * 0.3 : 0; }
+    }
+    d.life -= dt;
+  }
+  drops = drops.filter((d) => {
+    if (d.life <= 0) return false;
+    const byPlayer = player.vert === 0 && player.row === d.row && d.y >= d.ty - 2 && Math.abs(player.x - d.x) < T.pickupR + 4;
+    const byDisc = (disc.state === 'fly' || disc.state === 'return') && Math.hypot(disc.x - d.x, disc.y - d.y) < T.discR + 12;
+    return !((byPlayer || byDisc) && collect(d));
+  });
+}
+
+// Welche Deckung ließe sich gerade reparieren? Die, hinter der die Figur hockt, wenn sie beschädigt ist,
+// oder eine zerschossene in der eigenen Reihe direkt neben der Figur.
+function repairTarget() {
+  if (player.vert !== 0 || player.pop !== 0) return -1;
+  if (player.cover >= 0) {
+    const c = covers[player.cover];
+    return c.maxHp > 0 && c.hp < c.maxHp ? player.cover : -1;
+  }
+  return covers.findIndex((c) => c.row === player.row && c.dead && c.maxHp > 0 && Math.abs(player.x - c.x) < c.w / 2 + T.snapRange + 10);
+}
+const canRepair = () => !repair && bricks > 0 && !gameOver && !clash && repairTarget() >= 0;
+function startRepair() {
+  if (!canRepair()) return;
+  repair = { cover: repairTarget(), t: 0, tick: 0 };
+  sfx('hammer');
+}
+function cancelRepair() {
+  if (!repair) return;
+  repair = null;
+  sfx('cancel');
+}
+// Das Spiel läuft weiter; Bewegen, Werfen oder Reihenwechsel brechen ab
+function updateRepair(dt: number) {
+  if (!repair) return;
+  const i = repair.cover;
+  const c = covers[i];
+  const away = c.dead ? Math.abs(player.x - c.x) > c.w / 2 + T.snapRange + 10 : player.cover !== i;
+  if (getInput().x !== 0 || player.vert !== 0 || player.pop !== 0 || away) { cancelRepair(); return; }
+  repair.t += dt;
+  repair.tick -= dt;
+  if (repair.tick <= 0) {
+    repair.tick = 0.28;
+    sfx('hammer');
+    burst(c.x + rand(-c.w / 3, c.w / 3), c.y, '#c98a3c', 3, 70);
+  }
+  if (repair.t < T.repairTime) return;
+  bricks--;
+  if (c.dead) {
+    c.dead = false;
+    c.hp = c.maxHp * T.brickRepair;
+    player.cover = i; // gleich dahinter ducken
+  } else {
+    c.hp = Math.min(c.maxHp, c.hp + c.maxHp * T.brickRepair);
+  }
+  floatText(c.x, c.y - 20, 'Repariert', '#e3aa5c', 14);
+  sfx('repaired');
+  repair = null;
 }
 // Explosion des Selbstzerstörers: trifft die Figur und alle Gegner im Radius, auch andere Selbstzerstörer
 function explode(en: Enemy) {
@@ -708,7 +963,7 @@ function explode(en: Enemy) {
   sfx('explode');
   buzz(70);
   for (const o of enemies) {
-    if (o === en || o.dead || Math.hypot(o.x - en.x, o.y - en.y) > T.bomberBlastR) continue;
+    if (o === en || o.dead || o.spawnT > 0 || Math.hypot(o.x - en.x, o.y - en.y) > T.bomberBlastR) continue;
     o.hp -= T.bomberEnemyDmg;
     o.flash = 1;
     if (o.hp <= 0) killEnemy(o, T.kinds[o.kind].score);
@@ -810,6 +1065,7 @@ function hurtBoss(dmg: number) {
   if (b.hp > 0) return;
   gore(b.x, b.y, 12);
   gibs(b.x, b.y, '#b9a27c', 30);
+  spawnDrops(b.x, b.y, 'boss');
   sfx('explode');
   sfx('win');
   score += T.bossScore;
@@ -875,7 +1131,7 @@ let lastHit = { x: 0, y: 0 }; // Ort des zuletzt getroffenen Gegners, für die A
 function hitEnemies() {
   let n = 0;
   for (const en of enemies) {
-    if (en.hp <= 0 || en.hitCd > 0) continue;
+    if (en.hp <= 0 || en.hitCd > 0 || en.spawnT > 0) continue;
     if (Math.hypot(disc.x - en.x, disc.y - en.y) >= T.kinds[en.kind].r + T.discR) continue;
     lastHit = { x: en.x, y: en.y };
     hitEnemy(en);
@@ -955,6 +1211,7 @@ function walkTo(en: Enemy, tx: number, ty: number, speed: number, dt: number) {
 
 // Gegner: zur Deckung laufen → verstecken → seitlich heraustreten → zielen → schießen → zurück.
 function updateEnemy(en: Enemy, dt: number) {
+  if (en.spawnT > 0) { en.spawnT -= dt; return; }
   en.hitCd -= dt;
   en.flash = Math.max(0, en.flash - dt * 6);
   const k = T.kinds[en.kind];
@@ -1002,11 +1259,12 @@ function updateEnemy(en: Enemy, dt: number) {
       en.timer -= dt;
       if (en.timer <= 0) {
         const exposed = enemies.filter((o) => o.state === 'out' || o.state === 'aim').length;
-        if (exposed < T.maxAimers) en.state = 'out'; else en.timer = 0.3;
+        const limit = T.maxAimers + (playerExposed() ? T.exposedExtraAimers : 0);
+        if (exposed < limit) en.state = 'out'; else en.timer = 0.3;
       }
       break;
     case 'out':
-      if (walkTo(en, peek.x, peek.y, k.peek, dt)) { en.state = 'aim'; en.timer = k.aim; en.shots = Math.floor(rand(k.burstMin, k.burstMax + 1)); }
+      if (walkTo(en, peek.x, peek.y, k.peek, dt)) { en.state = 'aim'; en.timer = k.aim * (playerExposed() ? T.exposedAimMul : 1); en.shots = Math.floor(rand(k.burstMin, k.burstMax + 1)); }
       break;
     case 'aim':
       en.timer -= dt;
@@ -1186,6 +1444,21 @@ function update(dt: number) {
   anim.face += (faceTo - anim.face) * Math.min(1, dt * 16);
   anim.throwT = Math.max(0, anim.throwT - dt);
   player.sinceHit += dt;
+  // im Freien (nicht geduckt) zählt die Zeit hoch, in Deckung sofort zurück
+  exposedT = isCovered() || player.vert !== 0 ? 0 : exposedT + dt;
+  // Hitze: in der Hand schneller abkühlen; Zwangspause läuft ab, dabei dampft die Säge
+  if (disc.overheat > 0) {
+    disc.overheat -= dt;
+    disc.heat = Math.max(0, disc.overheat / T.overheatTime);
+    if (Math.random() < 0.5) {
+      const sx = disc.state === 'held' ? player.x : disc.x;
+      const sy = disc.state === 'held' ? handY() : disc.y;
+      particles.push({ x: sx + rand(-5, 5), y: sy, vx: rand(-15, 15), vy: rand(-70, -35), life: 0.6, max: 0.6, color: '#d9d4e2', size: rand(3, 6) });
+    }
+    if (disc.overheat <= 0) { disc.overheat = 0; disc.heat = 0; sfx('cooled'); }
+  } else {
+    disc.heat = Math.max(0, disc.heat - (disc.state === 'held' ? T.heatCoolHeld : T.heatCoolFly) * dt);
+  }
   if (player.sinceHit > (isCovered() ? T.regenDelayCover : T.regenDelay)) {
     player.hp = Math.min(T.playerHp, player.hp + T.regenRate * dt);
   }
@@ -1210,7 +1483,7 @@ function update(dt: number) {
   invuln = Math.max(0, invuln - dt);
   // Berührung: Selbstzerstörer explodieren, alle anderen gehen in den Nahkampf
   for (const en of enemies) {
-    if (en.dead || Math.hypot(en.x - player.x, en.y - bodyY()) >= T.kinds[en.kind].r + 10) continue;
+    if (en.dead || en.spawnT > 0 || Math.hypot(en.x - player.x, en.y - bodyY()) >= T.kinds[en.kind].r + 10) continue;
     if (en.kind === 'bomber') { killEnemy(en, 0); continue; }
     if (invuln <= 0) { startClash(en); return; }
   }
@@ -1291,8 +1564,10 @@ function update(dt: number) {
   if (disc.state === 'held') {
     disc.x = player.x;
     disc.y = handY();
-    if (fireHeld()) requestThrow();
+    if (fireHeld() && !repair) requestThrow();
   }
+  updateDrops(dt);
+  updateRepair(dt);
 }
 
 function updateFx(dt: number) {
@@ -1307,6 +1582,14 @@ function updateFx(dt: number) {
   for (const t of texts) { t.y -= 28 * dt; t.life -= dt; }
   texts = texts.filter((t) => t.life > 0);
   shake = Math.max(0, shake - dt * 30);
+  for (const p of portals) {
+    p.age += dt;
+    // Glut steigt aus dem offenen Tor
+    if (p.age < T.portalTime && Math.random() < 0.6) {
+      particles.push({ x: p.x + rand(-16, 16), y: p.y + rand(-4, 6), vx: rand(-20, 20), vy: rand(-90, -40), life: 0.5, max: 0.5, color: Math.random() < 0.5 ? '#ff5a1f' : '#ffd23f', size: rand(2, 4) });
+    }
+  }
+  portals = portals.filter((p) => p.age < T.portalTime + T.portalClose);
   catchFlash = Math.max(0, catchFlash - dt * 4);
   hurtFlash = Math.max(0, hurtFlash - dt * 3);
   fireFlash = Math.max(0, fireFlash - dt * 6);
@@ -1458,6 +1741,26 @@ function drawSaw(x: number, y: number, r: number, spin: number) {
   ctx.beginPath();
   ctx.arc(x, y, r * 0.16, 0, Math.PI * 2);
   ctx.fill();
+  // Hitze nur als Glühen: färbt das Blatt von gelb über orange nach rot, ab halber Hitze mit Hof;
+  // überhitzt blinkt es
+  const h = disc.heat;
+  if (h > 0.02) {
+    const hot = disc.overheat > 0 && Math.floor(performance.now() / 110) % 2 === 0;
+    const col = h > 0.7 ? '#ff3a1f' : h > 0.4 ? '#ff8a1f' : '#ffd23f';
+    if (h > 0.5 || hot) {
+      ctx.globalAlpha = hot ? 0.45 : (h - 0.5) * 0.7;
+      ctx.fillStyle = col;
+      ctx.beginPath();
+      ctx.arc(x, y, r + 6 + h * 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = hot ? 0.85 : h * 0.7;
+    ctx.fillStyle = col;
+    ctx.beginPath();
+    ctx.arc(x, y, r + 1.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
 }
 
 // Figur von oben, vorne = lokal -y. Zustände: stehen, laufen (Beine/Arme pendeln),
@@ -1610,22 +1913,37 @@ function drawControls() {
   ctx.stroke();
   comicText('FEUER', fireCx, cy + 6, 16, ready ? '#ffffff' : '#b9a6c2');
 
+  // Reparatur-Knopf: Ziegel mit Anzahl; leuchtet, wenn hier gerade etwas zu reparieren ist
+  if (started && !gameOver) {
+    const rb = repairBtn();
+    const can = canRepair();
+    ctx.beginPath();
+    ctx.arc(rb.x, rb.y, rb.r, 0, Math.PI * 2);
+    ctx.fillStyle = repair ? '#ffd23f' : can ? '#c98a3c' : '#4a3b52';
+    ctx.fill();
+    inkStroke(can || repair ? 3 : 2);
+    ctx.globalAlpha = can || repair || bricks > 0 ? 1 : 0.45;
+    drawBrickIcon(rb.x - 1, rb.y - 4, 22, 11);
+    comicText(`${bricks}`, rb.x, rb.y + 17, 11, '#ffffff');
+    ctx.globalAlpha = 1;
+  }
+
   // Ton-Knopf: Lautsprecher mit Wellen (alles), ohne Wellen (nur Effekte), durchgestrichen (stumm)
-  const mx = T.W / 2;
+  const { x: mx, y: my, r: mr } = soundBtn();
   const am = audioMode();
   ctx.beginPath();
-  ctx.arc(mx, cy, 17, 0, Math.PI * 2);
+  ctx.arc(mx, my, mr, 0, Math.PI * 2);
   ctx.fillStyle = '#5b4a66';
   ctx.fill();
   inkStroke(2.5);
   ctx.fillStyle = am === 2 ? '#8a7896' : '#ffffff';
   ctx.beginPath();
-  ctx.moveTo(mx - 9, cy - 3);
-  ctx.lineTo(mx - 5, cy - 3);
-  ctx.lineTo(mx, cy - 8);
-  ctx.lineTo(mx, cy + 8);
-  ctx.lineTo(mx - 5, cy + 3);
-  ctx.lineTo(mx - 9, cy + 3);
+  ctx.moveTo(mx - 8, my - 3);
+  ctx.lineTo(mx - 4, my - 3);
+  ctx.lineTo(mx + 1, my - 7);
+  ctx.lineTo(mx + 1, my + 7);
+  ctx.lineTo(mx - 4, my + 3);
+  ctx.lineTo(mx - 8, my + 3);
   ctx.closePath();
   ctx.fill();
   ctx.strokeStyle = ctx.fillStyle;
@@ -1633,16 +1951,214 @@ function drawControls() {
   ctx.lineCap = 'round';
   ctx.beginPath();
   if (am === 0) {
-    ctx.arc(mx + 1, cy, 5, -0.9, 0.9);
-    ctx.moveTo(mx + 1 + Math.cos(-0.9) * 9, cy + Math.sin(-0.9) * 9);
-    ctx.arc(mx + 1, cy, 9, -0.9, 0.9);
+    ctx.arc(mx + 2, my, 4.5, -0.9, 0.9);
+    ctx.moveTo(mx + 2 + Math.cos(-0.9) * 8, my + Math.sin(-0.9) * 8);
+    ctx.arc(mx + 2, my, 8, -0.9, 0.9);
   } else if (am === 2) {
     ctx.strokeStyle = BLOOD_HI;
     ctx.lineWidth = 3;
-    ctx.moveTo(mx - 9, cy + 9);
-    ctx.lineTo(mx + 9, cy - 9);
+    ctx.moveTo(mx - 8, my + 8);
+    ctx.lineTo(mx + 8, my - 8);
   }
   ctx.stroke();
+}
+
+// ---------- Beute, Reparatur, Levelübersicht ----------
+function drawCoinIcon(x: number, y: number, r: number) {
+  ctx.fillStyle = '#ffd23f';
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+  inkStroke(2);
+  ctx.strokeStyle = '#c99a12';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(x, y, r * 0.6, 0, Math.PI * 2);
+  ctx.stroke();
+}
+function drawHeartIcon(x: number, y: number, s: number) {
+  ctx.fillStyle = BLOOD_HI;
+  ctx.beginPath();
+  ctx.moveTo(x, y + s * 0.9);
+  ctx.bezierCurveTo(x - s * 1.4, y, x - s * 0.9, y - s * 1.1, x, y - s * 0.4);
+  ctx.bezierCurveTo(x + s * 0.9, y - s * 1.1, x + s * 1.4, y, x, y + s * 0.9);
+  ctx.closePath();
+  ctx.fill();
+  inkStroke(2);
+}
+function drawBrickIcon(x: number, y: number, w: number, h: number) {
+  ctx.beginPath();
+  ctx.rect(x - w / 2, y - h / 2, w, h);
+  ctx.fillStyle = '#c96a3c';
+  ctx.fill();
+  inkStroke(2);
+  ctx.beginPath();
+  ctx.moveTo(x - w / 2, y);
+  ctx.lineTo(x + w / 2, y);
+  ctx.moveTo(x - w / 6, y - h / 2);
+  ctx.lineTo(x - w / 6, y);
+  ctx.moveTo(x + w / 4, y);
+  ctx.lineTo(x + w / 4, y + h / 2);
+  inkStroke(1.2);
+}
+function drawDrops() {
+  for (const d of drops) {
+    if (d.life < 2 && Math.floor(d.life * 8) % 2 === 0) continue; // blinkt kurz vor dem Verschwinden
+    const bob = d.y >= d.ty ? Math.sin(performance.now() / 200 + d.x) * 1.5 : 0;
+    ctx.fillStyle = 'rgba(26,15,28,0.35)';
+    ctx.beginPath();
+    ctx.ellipse(d.x, d.ty + 6, 8, 3, 0, 0, Math.PI * 2);
+    ctx.fill();
+    if (d.kind === 'coin') drawCoinIcon(d.x, d.y + bob, 6);
+    else if (d.kind === 'heart') drawHeartIcon(d.x, d.y + bob, 7);
+    else drawBrickIcon(d.x, d.y + bob, 16, 9);
+  }
+}
+// Kleines Fenster über der Bedienleiste: Fortschritt der Reparatur, Tipp darauf bricht ab
+function drawRepairPopup() {
+  if (!repair) return;
+  const p = repairPopup();
+  ctx.fillStyle = 'rgba(26,15,28,0.92)';
+  ctx.beginPath();
+  ctx.roundRect(p.x, p.y, p.w, p.h, 9);
+  ctx.fill();
+  ctx.strokeStyle = '#ffd23f';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  drawBrickIcon(p.x + 20, p.y + p.h / 2, 18, 10);
+  comicText('Reparatur', p.x + 36, p.y + 15, 11, '#ffffff', 'left');
+  hpBar(p.x + 36 + 58, p.y + 23, 116, 6, repair.t / T.repairTime, '#e3aa5c');
+  // Abbrechen
+  const cx = p.x + p.w - 17;
+  const cy = p.y + p.h / 2;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 11, 0, Math.PI * 2);
+  ctx.fillStyle = BLOOD_HI;
+  ctx.fill();
+  inkStroke(2);
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2.5;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(cx - 4, cy - 4);
+  ctx.lineTo(cx + 4, cy + 4);
+  ctx.moveTo(cx + 4, cy - 4);
+  ctx.lineTo(cx - 4, cy + 4);
+  ctx.stroke();
+}
+
+// Höllentor von oben: glühender Riss im Boden mit kreisender Glut, öffnet und schließt sich
+function drawPortals() {
+  const total = T.portalTime + T.portalClose;
+  for (const p of portals) {
+    const open = p.age < 0.25 ? p.age / 0.25 : p.age > T.portalTime ? Math.max(0, (total - p.age) / T.portalClose) : 1;
+    if (open <= 0) continue;
+    const rx = 24 * open;
+    const ry = 13 * open;
+    const spin = p.age * 7;
+    ctx.fillStyle = 'rgba(255,90,31,0.28)';
+    ctx.beginPath();
+    ctx.ellipse(p.x, p.y, rx + 10, ry + 7, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#ff5a1f';
+    ctx.beginPath();
+    ctx.ellipse(p.x, p.y, rx, ry, 0, 0, Math.PI * 2);
+    ctx.fill();
+    inkStroke(2.5);
+    ctx.fillStyle = '#2a0a10';
+    ctx.beginPath();
+    ctx.ellipse(p.x, p.y, rx * 0.68, ry * 0.62, 0, 0, Math.PI * 2);
+    ctx.fill();
+    // kreisende Glutbögen
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = '#ffd23f';
+    ctx.lineWidth = 2;
+    for (let k = 0; k < 3; k++) {
+      const a = spin + (k * Math.PI * 2) / 3;
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y, rx * 0.84, ry * 0.8, 0, a, a + 1.1);
+      ctx.stroke();
+    }
+  }
+}
+
+// Levelübersicht: Blöcke zu fünf Leveln, jeder beginnt mit einem Checkpoint. Gesperrte Blöcke zeigen
+// schon, was kommt, lassen sich aber erst starten, wenn das Spiel bis dorthin gekommen ist.
+function drawMenu() {
+  ctx.fillStyle = '#2a1626';
+  ctx.fillRect(0, 0, T.W, H);
+  comicText('SCHROTTWALL', T.W / 2, T.topY + 18, 30, '#ffd23f');
+  drawCoinIcon(T.W / 2 - 34, T.topY + 44, 7);
+  comicText(`${coins}`, T.W / 2 - 22, T.topY + 49, 14, '#ffffff', 'left');
+  comicText(`Rekord ${record}`, T.W / 2 + 46, T.topY + 49, 11, '#b9a6c2');
+
+  const top = T.topY + 66;
+  const avail = H - T.ctrlH - top - 34;
+  const count = 6;
+  const gap = 7;
+  const h = Math.min(66, (avail - gap * (count - 1)) / count);
+  const per = T.checkpointEvery;
+  // zwei freigeschaltete Blöcke vor dem aktuellen zeigen, der Rest ist Vorschau
+  const firstBlock = Math.max(0, Math.floor((checkpoint - 1) / per) - 2);
+  menuCards = [];
+  for (let i = 0; i < count; i++) {
+    const from = (firstBlock + i) * per + 1;
+    const to = from + per - 1;
+    const open = from <= checkpoint;
+    const y = top + i * (h + gap);
+    const card: MenuCard = { x: 16, y, w: T.W - 32, h, level: from, open };
+    menuCards.push(card);
+    ctx.beginPath();
+    ctx.roundRect(card.x, y, card.w, h, 10);
+    ctx.fillStyle = open ? (from === checkpoint ? '#5a3a4c' : '#432c3e') : '#30202c';
+    ctx.fill();
+    inkStroke(2.5);
+    comicText(`Level ${from}–${to}`, card.x + 12, y + 22, 15, open ? '#ffffff' : '#8a7896', 'left');
+    // Vorschau: welche Gegner in diesem Block vorkommen
+    const kinds = new Set<EnemyKind>();
+    let hasBoss = false;
+    for (let n = from; n <= to; n++) {
+      const plan = levelPlan(n);
+      if (plan.boss) hasBoss = true;
+      plan.kinds.forEach((k) => kinds.add(k));
+    }
+    let ix = card.x + 22;
+    const iy = y + h - 16;
+    ctx.globalAlpha = open ? 1 : 0.55;
+    for (const k of ['grunt', 'bomber', 'tank', 'sniper'] as EnemyKind[]) {
+      if (!kinds.has(k)) continue;
+      drawDemon(ix, iy, 8, KIND_COLOR[k], k === 'sniper' ? BLOOD_HI : '#ffd23f', k === 'tank' ? 1.4 : 1);
+      ix += 24;
+    }
+    if (hasBoss) comicText('BOSS', ix + 6, iy + 5, 12, BLOOD_HI, 'left');
+    ctx.globalAlpha = 1;
+    // rechts: Start oder Schloss
+    const bx = card.x + card.w - 46;
+    const by = y + h / 2;
+    if (open) {
+      ctx.beginPath();
+      ctx.roundRect(bx - 30, by - 15, 64, 30, 15);
+      ctx.fillStyle = BLOOD_HI;
+      ctx.fill();
+      inkStroke(2.5);
+      comicText(from === checkpoint ? 'START' : 'NOCHMAL', bx + 2, by + 5, from === checkpoint ? 13 : 10, '#ffffff');
+    } else {
+      ctx.fillStyle = '#8a7896';
+      ctx.beginPath();
+      ctx.roundRect(bx - 9, by - 3, 18, 14, 3);
+      ctx.fill();
+      inkStroke(2);
+      ctx.beginPath();
+      ctx.arc(bx, by - 3, 6, Math.PI, 0);
+      ctx.strokeStyle = INK;
+      ctx.lineWidth = 5;
+      ctx.stroke();
+      ctx.strokeStyle = '#8a7896';
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+  }
+  comicText('Kreuz = laufen · Feuer = werfen · in die Zone = PERFEKT', T.W / 2, H - T.ctrlH - 14, 10, '#b9a6c2');
 }
 
 // Eigener Bildschirm für den Nahkampf. Platzhalter-Grafik, die richtige Animation kommt später.
@@ -1711,6 +2227,11 @@ function draw() {
   ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * (offX + sx * scale), dpr * (offY + sy * scale));
   if (clash) {
     drawClash(clash);
+    drawControls();
+    return;
+  }
+  if (!started && !testStart) {
+    drawMenu();
     drawControls();
     return;
   }
@@ -1797,8 +2318,22 @@ function draw() {
     inkStroke(1.2);
   });
 
+  drawPortals();
+
   // Gegner
   for (const en of enemies) {
+    if (en.spawnT > 0) {
+      // steigt aus dem Tor: wächst in der zweiten Hälfte der Öffnungszeit heran
+      const g = clamp(((T.portalTime - en.spawnT) / T.portalTime) * 2 - 1, 0, 1);
+      if (g <= 0) continue;
+      ctx.save();
+      ctx.globalAlpha = g;
+      ctx.translate(en.x, en.y);
+      ctx.scale(g, g);
+      drawDemon(0, 0, T.kinds[en.kind].r, KIND_COLOR[en.kind], '#ffd23f', en.kind === 'tank' ? 1.4 : en.kind === 'sniper' ? 0.5 : 1);
+      ctx.restore();
+      continue;
+    }
     if (en.state === 'aim') {
       // Vorwarnung: Ziellinie wird bis zum Schuss kräftiger
       ctx.strokeStyle = `rgba(226,32,58,${0.2 + 0.6 * (1 - clamp(en.timer / T.kinds[en.kind].aim, 0, 1))})`;
@@ -1847,6 +2382,18 @@ function draw() {
     ctx.beginPath();
     ctx.arc(b.x, b.y, b.r * 0.45, 0, Math.PI * 2);
     ctx.fill();
+  }
+
+  drawDrops();
+
+  // Zu lange im Freien: pulsierender roter Ring unter der Figur, die Gegner zielen jetzt gezielt
+  if (started && !gameOver && playerExposed()) {
+    const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 90);
+    ctx.strokeStyle = `rgba(226,32,58,${0.45 + pulse * 0.45})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.ellipse(player.x, bodyY() + 8, 20 + pulse * 3, 9 + pulse * 1.5, 0, 0, Math.PI * 2);
+    ctx.stroke();
   }
 
   // Spieler + Fangzone
@@ -1941,12 +2488,15 @@ function draw() {
     ctx.fillRect(0, T.topY, T.W, H - T.ctrlH - T.topY);
   }
 
+  drawRepairPopup();
   drawControls();
 
-  // HUD
-  comicText(String(score), 12, 31, 19, '#ffffff', 'left');
-  comicText(`Serie ${streak} · Best ${bestStreak}`, T.W - 12, 29, 12, streak > 0 ? LEVEL_COLORS[disc.level] : '#b9a6c2', 'right');
-  if (wave > 0 || bossMode) comicText(bossMode ? 'Boss-Test' : `Level ${Math.max(wave, startLevel)}`, T.W / 2, 29, 13, '#ffd23f');
+  // HUD: links Punkte und Serie, Mitte Level, rechts Münzen
+  comicText(String(score), 12, 24, 17, '#ffffff', 'left');
+  comicText(`Serie ${streak} · Best ${bestStreak}`, 12, 40, 10, streak > 0 ? LEVEL_COLORS[disc.level] : '#b9a6c2', 'left');
+  drawCoinIcon(T.W - 52, 24, 7);
+  comicText(`${coins}`, T.W - 40, 29, 14, '#ffffff', 'left');
+  if (wave > 0 || bossMode) comicText(bossMode ? 'Boss-Test' : `Level ${Math.max(wave, runStart)}`, T.W / 2, 29, 13, '#ffd23f');
   if (bossMode && started && !gameOver && disc.level === 0 && disc.state === 'held') {
     comicText('Werfen → er schleudert sie weg → in der Zone fangen', T.W / 2, floorY() + 8, 11, '#d9c9e2');
   }
@@ -1982,7 +2532,7 @@ function draw() {
     comicText(bossMode ? `Punkte ${score}` : `Level ${wave} · Punkte ${score}`, T.W / 2, H / 2 + 4, 17, '#ffffff');
     const rec = score >= record && score > 0;
     comicText(rec ? 'Neuer Rekord!' : `Rekord ${record}`, T.W / 2, H / 2 + 30, 14, rec ? '#ffd23f' : '#b9a6c2');
-    comicText('Tippen für Neustart', T.W / 2, H / 2 + 62, 14, '#ffffff');
+    comicText(testStart ? 'Tippen für Neustart' : 'Tippen → Levelübersicht', T.W / 2, H / 2 + 62, 14, '#ffffff');
   }
 }
 
