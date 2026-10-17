@@ -2,6 +2,7 @@
 // Eine Arena, eine Disc, ein Gegnertyp. Alles zum Drehen steht in T.
 import { initTuner } from './tuner';
 import { audioMode, cycleAudioMode, setMusicIntensity, sfx, unlockAudio } from './audio';
+import { UPGRADES, buy, canBuy, boughtCount, nextSlotAt, priceOf, sandboxUpgrades, tier, upgradeSlots } from './upgrades';
 
 const T = {
   W: 360, // logische Breite; Höhe ergibt sich aus dem Seitenverhältnis
@@ -154,6 +155,47 @@ const T = {
 
 const LEVEL_COLORS = ['#ffffff', '#3fd4ff', '#ffd23f', '#ff4fa3'];
 
+// Werte nach Upgrades (Grundwert aus T, Aufschlag je gekaufter Stufe)
+const maxHp = () => T.playerHp + 20 * tier('vitality');
+const coverMaxHp = () => T.coverHp * (1 + 0.25 * tier('armor'));
+const heatPer = () => T.heatPerThrow * (1 - 0.15 * tier('cooling'));
+const coolMul = () => 1 + 0.25 * tier('cooling');
+const zoneMul = () => 1 + 0.15 * tier('net');
+const brickCap = () => T.maxBricks + 2 * tier('bricks');
+const repairDur = () => T.repairTime * (1 - 0.25 * tier('bricks'));
+
+// Welt (Oberwelt) mit eigenem Look. Später kommen weitere Welten mit eigenen Themen, Gegnern und Effekten.
+const WORLD = {
+  name: 'Die Gruft',
+  floor: '#3e3446',
+  floorLine: '#2f2637',
+  moss: '#566139',
+  wall: '#241628',
+  wallLine: '#3a2a40',
+};
+// Bodenschmuck und Fackeln: aus festem Startwert, damit sie bei jedem Neuaufbau gleich liegen
+interface Deco { kind: number; x: number; y: number; s: number; a: number }
+let floorDeco: Deco[] = [];
+let torches: { x: number; y: number; ph: number }[] = [];
+function buildScenery() {
+  let seed = 1337;
+  const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  floorDeco = [];
+  for (let i = 0; i < 26; i++) {
+    floorDeco.push({ kind: rnd() < 0.45 ? 0 : 1, x: 10 + rnd() * (T.W - 20), y: T.topY + 10 + rnd() * (H - T.ctrlH - T.topY - 20), s: 5 + rnd() * 9, a: rnd() * Math.PI * 2 });
+  }
+  torches = [];
+  for (let y = T.topY + 70, k = 0; y < H - T.ctrlH - 40; y += 150, k++) {
+    torches.push({ x: 11, y, ph: k * 1.7 }, { x: T.W - 11, y: y + 75, ph: k * 2.3 + 1 });
+  }
+}
+
+// Zeitweise Umgebungs-Animationen: Nebel, Windstoß, eine Ratte. Nie dauerhaft, immer mit Pause dazwischen.
+type AmbientKind = 'fog' | 'wind' | 'rat';
+let ambient: { kind: AmbientKind; t: number; dur: number } | null = null;
+let ambientWait = 12;
+let rat: { x: number; y: number; dir: number; pause: number; paused: boolean } | null = null;
+
 type DiscState = 'held' | 'fly' | 'return' | 'down' | 'boss'; // down = liegt am Boden, boss = der Boss hält sie
 type ZoneKind = keyof typeof T.catchZone;
 type EnemyState = 'move' | 'hide' | 'out' | 'aim' | 'back' | 'charge';
@@ -253,9 +295,17 @@ try { record = Number(localStorage.getItem('schrottwall.record')) || 0; } catch 
 
 // Dauerhaft gespeichert: Münzen (für spätere Upgrades) und der höchste freigeschaltete Checkpoint
 const loadNum = (key: string, def: number) => { try { return Number(localStorage.getItem(key)) || def; } catch { return def; } };
-const saveNum = (key: string, v: number) => { try { localStorage.setItem(key, String(v)); } catch { /* privates Fenster */ } };
-let coins = loadNum('schrottwall.coins', 0);
+// ?shop: Spielwiese zum Ausprobieren des Shops – viel Geld, alle Plätze frei, nichts wird gespeichert
+const shopTest = location.search.includes('shop');
+if (shopTest) sandboxUpgrades();
+const saveNum = (key: string, v: number) => {
+  if (shopTest) return;
+  try { localStorage.setItem(key, String(v)); } catch { /* privates Fenster */ }
+};
+let coins = shopTest ? 500 : loadNum('schrottwall.coins', 0);
 let checkpoint = loadNum('schrottwall.checkpoint', 1);
+// höchstes geschafftes Level (für Shop-Plätze); wer schon Checkpoints hat, hat die Level davor geschafft
+let levelsDone = shopTest ? 45 : Math.max(loadNum('schrottwall.levelsDone', 0), checkpoint - 1);
 let bricks = 0; // nur für die laufende Runde
 
 type DropKind = 'coin' | 'heart' | 'brick';
@@ -268,12 +318,16 @@ let portals: Portal[] = [];
 let repair: { cover: number; t: number; tick: number } | null = null;
 
 // Levelübersicht vor dem Start – außer auf den Testseiten (?level, ?boss, ?clash)
-const testStart = /[?&](level|boss|clash|repair)/.test(location.search);
+const testStart = /[?&](level|boss|clash|repair|ambient)/.test(location.search);
 // Testseite: ?repair startet mit vollen Ziegeln, beschädigter und zerschossener Deckung und Beute am Boden
 const repairTest = location.search.includes('repair');
 let runStart = startLevel;
 interface MenuCard { x: number; y: number; w: number; h: number; level: number; open: boolean }
 let menuCards: MenuCard[] = [];
+// Übersicht oder Shop; Knöpfe werden beim Zeichnen gesammelt und beim Tippen geprüft
+let menuView: 'levels' | 'shop' = shopTest ? 'shop' : 'levels';
+interface MenuBtn { x: number; y: number; w: number; h: number; act: () => void }
+let menuButtons: MenuBtn[] = [];
 let spawnTimer = 1;
 let gameOver = false;
 let gameOverAt = 0;
@@ -308,14 +362,14 @@ function floatText(x: number, y: number, text: string, color: string, size = 16)
 function layout() {
   const y0 = T.topY;
   const span = playerY() - y0;
-  const hp = (row: number) => (row >= 0 ? { hp: T.coverHp, maxHp: T.coverHp, dead: false } : { hp: 0, maxHp: 0, dead: false });
+  const hp = (row: number) => (row >= 0 ? { hp: coverMaxHp(), maxHp: coverMaxHp(), dead: false } : { hp: 0, maxHp: 0, dead: false });
   const f = (fx: number, fy: number, w: number, weight: number, row = -1): Cover =>
     ({ x: fx * T.W, y: y0 + fy * span, w, h: 16, weight, row, ...hp(row) });
   const old = covers;
   covers = [
     f(0.22, 0.14, 64, 3),
     f(0.78, 0.14, 64, 3),
-    f(0.5, 0.34, 72, 2),
+    f(0.5, 0.34, 56, 2),
     f(0.22, 0.56, 60, 1.5, 1),
     f(0.78, 0.56, 60, 1.5, 1),
     { x: 0.22 * T.W, y: playerY() - COVER_GAP, w: 60, h: 12, weight: 0, row: 0, ...hp(0) },
@@ -324,6 +378,7 @@ function layout() {
   // Größenänderung des Fensters soll den Schaden nicht zurücksetzen
   covers.forEach((c, i) => { if (old[i]) { c.hp = old[i].hp; c.dead = old[i].dead; } });
   row1Y = y0 + 0.56 * span + COVER_GAP;
+  buildScenery();
   if (player.vert === 0) player.y = rowY(player.row);
   if (slots.length === 0) {
     covers.forEach((c, i) => {
@@ -358,7 +413,7 @@ const coverAt = (x: number, y: number, pad: number) =>
 const inCover = (x: number, y: number, pad: number) => coverAt(x, y, pad) >= 0;
 
 function restoreCovers() {
-  for (const c of covers) { c.hp = c.maxHp; c.dead = false; }
+  for (const c of covers) { if (c.row >= 0) c.maxHp = coverMaxHp(); c.hp = c.maxHp; c.dead = false; }
 }
 function damageCover(i: number, dmg: number) {
   const c = covers[i];
@@ -451,7 +506,7 @@ function startWave(n: number) {
   }
 }
 function setupRepairTest() {
-  bricks = T.maxBricks - 1; // einer Platz für den Ziegel am Boden
+  bricks = brickCap() - 1; // einer Platz für den Ziegel am Boden
   covers.forEach((c) => {
     if (c.maxHp === 0) return;
     if (c.row === 0 && c.x > T.W / 2) c.dead = true; // rechte Deckung vorne: zerschossen
@@ -512,7 +567,7 @@ function endGame() {
   gameOverAt = performance.now();
   if (score > record) {
     record = score;
-    try { localStorage.setItem('schrottwall.record', String(record)); } catch { /* privates Fenster */ }
+    if (!shopTest) { try { localStorage.setItem('schrottwall.record', String(record)); } catch { /* privates Fenster */ } }
   }
 }
 
@@ -523,6 +578,9 @@ function reset() {
   texts = [];
   decals = [];
   portals = [];
+  ambient = null;
+  rat = null;
+  ambientWait = location.search.includes('ambient') ? 1 : rand(8, 16); // ?ambient: sofort, zum Ansehen
   for (const s of slots) s.taken = false;
   score = 0;
   streak = 0;
@@ -549,7 +607,7 @@ function reset() {
   runSpeed = 0;
   anim.face = 0;
   player.x = covers[player.cover].x;
-  player.hp = T.playerHp;
+  player.hp = maxHp();
   player.sinceHit = 99;
   stickHold = 0;
   stepTo = null;
@@ -644,6 +702,9 @@ function startRun(level: number) {
 }
 // Tipp auf eine Karte der Levelübersicht: nur freigeschaltete Checkpoints lassen sich starten
 function menuTap(p: { x: number; y: number }) {
+  const btn = menuButtons.find((b) => p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h);
+  if (btn) { btn.act(); return; }
+  if (menuView !== 'levels') return;
   const card = menuCards.find((c) => p.x >= c.x && p.x <= c.x + c.w && p.y >= c.y && p.y <= c.y + c.h);
   if (!card) return;
   if (card.open) startRun(card.level);
@@ -658,7 +719,7 @@ const repairPopup = () => ({ x: T.W / 2 - 100, y: H - T.ctrlH - 50, w: 200, h: 3
 function wake(p?: { x: number; y: number }) {
   unlockAudio();
   if (!started && !testStart) {
-    if (p) menuTap(p); else startRun(checkpoint);
+    if (p) menuTap(p); else if (menuView === 'levels') startRun(checkpoint);
     return true;
   }
   // Zum Abstimmen: mit ?clash in der Adresse startet das Spiel direkt im Nahkampf
@@ -754,7 +815,7 @@ function throwDisc() {
   disc.state = 'fly';
   disc.trail = [];
   anim.throwT = 0.18;
-  disc.heat += T.heatPerThrow;
+  disc.heat += heatPer();
   if (disc.heat >= 1) {
     // überhitzt: dieser Wurf geht noch, danach muss die Säge abkühlen
     disc.heat = 1;
@@ -772,7 +833,7 @@ function throwDisc() {
 function beginReturn(kind: ZoneKind, off?: { x: number; y: number }, speed?: number) {
   const z = T.catchZone[kind];
   const L = T.levels[disc.level];
-  const r = z.r * L.zone;
+  const r = z.r * L.zone * zoneMul();
   const row = player.vert !== 0 ? player.row + player.vert : player.row;
   const lineY = rowY(row) - 18;
   let side: number;
@@ -806,6 +867,7 @@ function beginReturn(kind: ZoneKind, off?: { x: number; y: number }, speed?: num
   disc.zone = { x: clamp(player.x + side * mag, r + 4, T.W - r - 4), y: rowY(row), r, row };
   disc.retSpeed = speed ?? L.ret;
   disc.state = 'return';
+  if (kind === 'none') sfx('chain'); // Kette zu Ende, nichts getroffen: sie rasselt zurück
 }
 
 // Landung in der Fangzone: steht die Figur drin, fängt sie von selbst. Nach einem Treffer ist das PERFEKT
@@ -872,12 +934,12 @@ function spawnDrops(x: number, y: number, from: EnemyKind | 'boss') {
 }
 function collect(d: Drop) {
   if (d.kind === 'brick') {
-    if (bricks >= T.maxBricks) return false;
+    if (bricks >= brickCap()) return false;
     bricks++;
     floatText(d.x, d.ty - 26, 'Ziegel', '#e3aa5c', 13);
     sfx('brick');
   } else if (d.kind === 'heart') {
-    player.hp = Math.min(T.playerHp, player.hp + T.heal);
+    player.hp = Math.min(maxHp(), player.hp + T.heal);
     floatText(d.x, d.ty - 26, `+${T.heal}`, '#5dff8f', 14);
     sfx('heart');
   } else {
@@ -941,7 +1003,7 @@ function updateRepair(dt: number) {
     sfx('hammer');
     burst(c.x + rand(-c.w / 3, c.w / 3), c.y, '#c98a3c', 3, 70);
   }
-  if (repair.t < T.repairTime) return;
+  if (repair.t < repairDur()) return;
   bricks--;
   if (c.dead) {
     c.dead = false;
@@ -1457,10 +1519,10 @@ function update(dt: number) {
     }
     if (disc.overheat <= 0) { disc.overheat = 0; disc.heat = 0; sfx('cooled'); }
   } else {
-    disc.heat = Math.max(0, disc.heat - (disc.state === 'held' ? T.heatCoolHeld : T.heatCoolFly) * dt);
+    disc.heat = Math.max(0, disc.heat - (disc.state === 'held' ? T.heatCoolHeld : T.heatCoolFly) * coolMul() * dt);
   }
   if (player.sinceHit > (isCovered() ? T.regenDelayCover : T.regenDelay)) {
-    player.hp = Math.min(T.playerHp, player.hp + T.regenRate * dt);
+    player.hp = Math.min(maxHp(), player.hp + T.regenRate * dt);
   }
 
   // Gegner
@@ -1490,10 +1552,19 @@ function update(dt: number) {
   enemies = enemies.filter((en) => en.hp > 0 && !en.dead);
   if (gameOver) return;
   if (waveBreak <= 0 && wave > 0 && spawnQueue.length === 0 && enemies.length === 0 && !boss && !bossMode) {
+    if (!testStart && wave > levelsDone) {
+      const before = upgradeSlots(levelsDone);
+      levelsDone = wave;
+      saveNum('schrottwall.levelsDone', levelsDone);
+      if (upgradeSlots(levelsDone) > before) {
+        floatText(T.W / 2, T.topY + 150, 'Neues Upgrade im Shop!', '#ffd23f', 16);
+        sfx('unlock');
+      }
+    }
     const bonus = 50 * wave;
     score += bonus;
     waveBreak = T.waveBreak;
-    player.hp = Math.min(T.playerHp, player.hp + T.waveHeal);
+    player.hp = Math.min(maxHp(), player.hp + T.waveHeal);
     floatText(T.W / 2, playerY() - 70, `Level ${wave} geschafft  +${bonus}`, '#5dff8f', 16);
     sfx('levelDone');
   }
@@ -1568,6 +1639,113 @@ function update(dt: number) {
   }
   updateDrops(dt);
   updateRepair(dt);
+  updateAmbient(dt);
+}
+
+const ambientEnvelope = () => (ambient ? clamp(Math.min(ambient.t, ambient.dur - ambient.t), 0, 1) : 0);
+function updateAmbient(dt: number) {
+  if (!ambient) {
+    ambientWait -= dt;
+    if (ambientWait > 0) return;
+    const kinds: AmbientKind[] = ['fog', 'wind', 'rat'];
+    const kind = kinds[Math.floor(Math.random() * kinds.length)];
+    ambient = { kind, t: 0, dur: kind === 'fog' ? 10 : kind === 'wind' ? 4 : 99 };
+    if (kind === 'wind') sfx('wind');
+    if (kind === 'rat') {
+      // läuft auf einer Bodenlinie zwischen den Reihen von Wand zu Wand und bleibt einmal schnuppernd stehen
+      const lines = [rowY(0) + 26, row1Y + 26, covers[2].y + 34];
+      const dir = Math.random() < 0.5 ? 1 : -1;
+      rat = { x: dir > 0 ? -12 : T.W + 12, y: lines[Math.floor(Math.random() * lines.length)], dir, pause: rand(0.3, 0.7), paused: false };
+      sfx('squeak');
+    }
+    return;
+  }
+  ambient.t += dt;
+  if (ambient.kind === 'wind' && Math.random() < 0.7) {
+    particles.push({ x: -5, y: rand(T.topY + 10, H - T.ctrlH - 10), vx: rand(240, 380), vy: rand(-20, 20), life: 1.4, max: 1.4, color: Math.random() < 0.5 ? '#9c8a6a' : '#7d7a8c', size: rand(1.5, 3) });
+  }
+  if (rat) {
+    const mid = Math.abs(rat.x - T.W / 2) < 40;
+    if (mid && !rat.paused) { rat.pause -= dt; if (rat.pause <= 0) rat.paused = true; }
+    else rat.x += rat.dir * 150 * dt;
+    // Die Säge erwischt sie: kleiner Spritzer und eine Münze
+    if ((disc.state === 'fly' || disc.state === 'return') && Math.hypot(disc.x - rat.x, disc.y - rat.y) < T.discR + 8) {
+      gore(rat.x, rat.y, 1);
+      sfx('squeak');
+      coins++;
+      saveNum('schrottwall.coins', coins);
+      floatText(rat.x, rat.y - 14, '+1', '#ffd23f', 13);
+      rat = null;
+    } else if (rat.x < -20 || rat.x > T.W + 20) rat = null;
+    if (!rat) ambient.t = ambient.dur;
+  }
+  if (ambient.t >= ambient.dur) {
+    ambient = null;
+    rat = null;
+    ambientWait = location.search.includes('ambient') ? 2 : rand(15, 35);
+  }
+}
+function drawRat() {
+  if (!rat) return;
+  const r = rat;
+  const still = Math.abs(r.x - T.W / 2) < 40 && !r.paused;
+  const step = still ? 0 : Math.sin(performance.now() / 40) * 2;
+  ctx.save();
+  ctx.translate(r.x, r.y);
+  ctx.scale(r.dir, 1);
+  ctx.strokeStyle = '#d98a9a';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(-8, 0);
+  ctx.quadraticCurveTo(-16, -4 + step, -22, 1);
+  ctx.stroke();
+  ctx.fillStyle = '#7d7a8c';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 9, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  inkStroke(1.5);
+  ctx.beginPath();
+  ctx.ellipse(8, still ? Math.sin(performance.now() / 70) : 0, 4.5, 3.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  inkStroke(1.5);
+  ctx.fillStyle = '#d98a9a';
+  ctx.beginPath();
+  ctx.arc(5, -4, 2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = INK;
+  ctx.beginPath();
+  ctx.arc(9.5, -1, 1, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+// Nebel und Windschlieren liegen über dem Spielfeld, aber unter Anzeige und Bedienung
+function drawAmbientOverlay() {
+  if (!ambient) return;
+  const env = ambientEnvelope();
+  const t = ambient.t;
+  const fieldH = H - T.ctrlH - T.topY;
+  if (ambient.kind === 'fog') {
+    for (let i = 0; i < 6; i++) {
+      const x = ((i * 97 + t * (14 + i * 3)) % (T.W + 260)) - 130;
+      const y = T.topY + 40 + ((i * 113) % fieldH);
+      const g = ctx.createRadialGradient(x, y, 10, x, y, 130);
+      g.addColorStop(0, `rgba(215,210,230,${0.16 * env})`);
+      g.addColorStop(1, 'rgba(215,210,230,0)');
+      ctx.fillStyle = g;
+      ctx.fillRect(x - 130, y - 130, 260, 260);
+    }
+  } else if (ambient.kind === 'wind') {
+    ctx.strokeStyle = `rgba(235,235,245,${0.28 * env})`;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let i = 0; i < 9; i++) {
+      const x = ((i * 53 + t * 460) % (T.W + 80)) - 40;
+      const y = T.topY + 25 + ((i * 71) % fieldH);
+      ctx.moveTo(x, y);
+      ctx.lineTo(x + 34, y + 2);
+    }
+    ctx.stroke();
+  }
 }
 
 function updateFx(dt: number) {
@@ -2027,7 +2205,7 @@ function drawRepairPopup() {
   ctx.stroke();
   drawBrickIcon(p.x + 20, p.y + p.h / 2, 18, 10);
   comicText('Reparatur', p.x + 36, p.y + 15, 11, '#ffffff', 'left');
-  hpBar(p.x + 36 + 58, p.y + 23, 116, 6, repair.t / T.repairTime, '#e3aa5c');
+  hpBar(p.x + 36 + 58, p.y + 23, 116, 6, repair.t / repairDur(), '#e3aa5c');
   // Abbrechen
   const cx = p.x + p.w - 17;
   const cy = p.y + p.h / 2;
@@ -2084,13 +2262,86 @@ function drawPortals() {
 
 // Levelübersicht: Blöcke zu fünf Leveln, jeder beginnt mit einem Checkpoint. Gesperrte Blöcke zeigen
 // schon, was kommt, lassen sich aber erst starten, wenn das Spiel bis dorthin gekommen ist.
+// Shop: Münzen gegen dauerhafte Upgrades. Plätze kommen mit dem Fortschritt, jeder Kauf wird teurer.
+function drawShop() {
+  comicText('SHOP', T.W / 2, T.topY + 18, 30, '#ffd23f');
+  drawCoinIcon(28, T.topY + 44, 7);
+  comicText(`${coins}`, 40, T.topY + 49, 14, '#ffffff', 'left');
+  const free = upgradeSlots(levelsDone) - boughtCount();
+  comicText(free > 0 ? `Upgrades frei: ${free}` : `Nächstes Upgrade nach Level ${nextSlotAt(levelsDone)}`,
+    T.W - 16, T.topY + 49, 11, free > 0 ? '#5dff8f' : '#b9a6c2', 'right');
+
+  const top = T.topY + 66;
+  const avail = H - T.ctrlH - top - 52;
+  const gap = 7;
+  const h = Math.min(70, (avail - gap * (UPGRADES.length - 1)) / UPGRADES.length);
+  UPGRADES.forEach((u, i) => {
+    const y = top + i * (h + gap);
+    const t = tier(u.id);
+    const price = priceOf(u.id);
+    ctx.beginPath();
+    ctx.roundRect(16, y, T.W - 32, h, 10);
+    ctx.fillStyle = '#432c3e';
+    ctx.fill();
+    inkStroke(2.5);
+    comicText(u.name, 28, y + h / 2 - 2, 14, '#ffffff', 'left');
+    comicText(u.desc, 28, y + h / 2 + 14, 9.5, '#d9c9e2', 'left');
+    // Stufen als Kästchen
+    for (let k = 0; k < u.tiers; k++) {
+      ctx.beginPath();
+      ctx.rect(T.W - 98 - 12 - (u.tiers - k) * 15, y + 12, 11, 8);
+      ctx.fillStyle = k < t ? '#ffd23f' : '#2a1c30';
+      ctx.fill();
+      inkStroke(1.5);
+    }
+    const bx = T.W - 98;
+    const by = y + h / 2 - 15;
+    if (t >= u.tiers) {
+      comicText('MAX', bx + 40, by + 20, 14, '#ffd23f');
+    } else {
+      const ok = canBuy(u.id, coins, levelsDone);
+      menuButton(bx, by, 80, 30, `${price}`, ok ? BLOOD_HI : '#5b4a66', () => {
+        if (!canBuy(u.id, coins, levelsDone)) { sfx('cancel'); return; }
+        coins -= price;
+        saveNum('schrottwall.coins', coins);
+        buy(u.id);
+        sfx('unlock');
+      });
+      drawCoinIcon(bx + 18, by + 15, 6);
+    }
+  });
+  menuButton(T.W / 2 - 60, H - T.ctrlH - 44, 120, 32, 'ZURÜCK', '#5b4a66', () => { menuView = 'levels'; sfx('pickup'); });
+}
+
+function menuButton(x: number, y: number, w: number, h: number, label: string, color: string, act: () => void, size = 13) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, h / 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  inkStroke(2.5);
+  comicText(label, x + w / 2, y + h / 2 + size * 0.36, size, '#ffffff');
+  menuButtons.push({ x, y, w, h, act });
+}
+
 function drawMenu() {
+  menuButtons = [];
   ctx.fillStyle = '#2a1626';
   ctx.fillRect(0, 0, T.W, H);
+  if (menuView === 'shop') { drawShop(); return; }
   comicText('SCHROTTWALL', T.W / 2, T.topY + 18, 30, '#ffd23f');
-  drawCoinIcon(T.W / 2 - 34, T.topY + 44, 7);
-  comicText(`${coins}`, T.W / 2 - 22, T.topY + 49, 14, '#ffffff', 'left');
-  comicText(`Rekord ${record}`, T.W / 2 + 46, T.topY + 49, 11, '#b9a6c2');
+  drawCoinIcon(28, T.topY + 44, 7);
+  comicText(`${coins}`, 40, T.topY + 49, 14, '#ffffff', 'left');
+  comicText(`Welt 1 · ${WORLD.name}`, T.W / 2, T.topY + 49, 12, '#d9c9e2');
+  const free = upgradeSlots(levelsDone) - boughtCount();
+  menuButton(T.W - 86, T.topY + 32, 70, 26, 'SHOP', free > 0 ? '#c98a3c' : '#5b4a66', () => { menuView = 'shop'; sfx('pickup'); });
+  if (free > 0) {
+    ctx.fillStyle = BLOOD_HI;
+    ctx.beginPath();
+    ctx.arc(T.W - 18, T.topY + 33, 8, 0, Math.PI * 2);
+    ctx.fill();
+    inkStroke(2);
+    comicText(`${free}`, T.W - 18, T.topY + 37, 10, '#ffffff');
+  }
 
   const top = T.topY + 66;
   const avail = H - T.ctrlH - top - 34;
@@ -2113,7 +2364,7 @@ function drawMenu() {
     ctx.fillStyle = open ? (from === checkpoint ? '#5a3a4c' : '#432c3e') : '#30202c';
     ctx.fill();
     inkStroke(2.5);
-    comicText(`Level ${from}–${to}`, card.x + 12, y + 22, 15, open ? '#ffffff' : '#8a7896', 'left');
+    comicText(`Level ${from}–${to}`, card.x + 12, y + h / 2 + 5, 14, open ? '#ffffff' : '#8a7896', 'left');
     // Vorschau: welche Gegner in diesem Block vorkommen
     const kinds = new Set<EnemyKind>();
     let hasBoss = false;
@@ -2122,15 +2373,16 @@ function drawMenu() {
       if (plan.boss) hasBoss = true;
       plan.kinds.forEach((k) => kinds.add(k));
     }
-    let ix = card.x + 22;
-    const iy = y + h - 16;
+    // Vorschau rechts neben dem Titel, in derselben Zeile
+    let ix = card.x + 132;
+    const iy = y + h / 2 + 3;
     ctx.globalAlpha = open ? 1 : 0.55;
     for (const k of ['grunt', 'bomber', 'tank', 'sniper'] as EnemyKind[]) {
       if (!kinds.has(k)) continue;
-      drawDemon(ix, iy, 8, KIND_COLOR[k], k === 'sniper' ? BLOOD_HI : '#ffd23f', k === 'tank' ? 1.4 : 1);
-      ix += 24;
+      drawDemon(ix, iy, 7, KIND_COLOR[k], k === 'sniper' ? BLOOD_HI : '#ffd23f', k === 'tank' ? 1.4 : 1);
+      ix += 20;
     }
-    if (hasBoss) comicText('BOSS', ix + 6, iy + 5, 12, BLOOD_HI, 'left');
+    if (hasBoss) comicText('BOSS', ix - 4, iy + 4, 11, BLOOD_HI, 'left');
     ctx.globalAlpha = 1;
     // rechts: Start oder Schloss
     const bx = card.x + card.w - 46;
@@ -2161,60 +2413,187 @@ function drawMenu() {
   comicText('Kreuz = laufen · Feuer = werfen · in die Zone = PERFEKT', T.W / 2, H - T.ctrlH - 14, 10, '#b9a6c2');
 }
 
-// Eigener Bildschirm für den Nahkampf. Platzhalter-Grafik, die richtige Animation kommt später.
+// Nahkampf von der Seite: links die Figur, rechts der Dämon, die Säge dazwischen.
+// Die Energie verschiebt den Berührpunkt: viel Energie drückt den Dämon nach rechts,
+// wenig lässt ihn die Figur nach links schieben. Der Kreis unten zeigt Energie und Restzeit.
 function drawClash(c: Clash) {
-  const cx = T.W / 2;
-  const cy = T.topY + (H - T.ctrlH - T.topY) / 2;
+  const top = T.topY;
+  const fieldH = H - T.ctrlH - top;
+  const S = clamp(fieldH / 584, 0.7, 1);
   const e = clamp(c.energy, 0, 1);
   const col = e > 0.5 ? '#5dff8f' : e > 0.25 ? '#ffd23f' : BLOOD_HI;
+  const now = performance.now();
   ctx.fillStyle = '#2a1626';
   ctx.fillRect(0, 0, T.W, H);
   ctx.fillStyle = `rgba(226,32,58,${(1 - e) * 0.3})`;
-  ctx.fillRect(0, T.topY, T.W, H - T.ctrlH - T.topY);
+  ctx.fillRect(0, top, T.W, fieldH);
 
-  comicText('NAHKAMPF', cx, cy - 135, c.intro > 0 ? 30 + c.intro * 30 : 30, BLOOD_HI);
+  const gy = top + fieldH * 0.58; // Boden
+  const shake = rand(-1, 1) * (1.4 - e);
+  const cx = T.W / 2 + (e - 0.5) * 150 * S + shake; // Berührpunkt an der Säge
+  const sy = gy - 58 * S;
+  // Boden mit Schleifspuren
+  ctx.fillStyle = '#3e3446';
+  ctx.fillRect(0, gy, T.W, 6 * S);
+  ctx.fillStyle = INK;
+  ctx.fillRect(0, gy, T.W, 2.5);
+  for (const fx of [cx - 72 * S, cx + 80 * S]) {
+    for (let k = 0; k < 3; k++) {
+      const a = ((now / 260 + k / 3) % 1);
+      ctx.globalAlpha = (1 - a) * 0.5;
+      ctx.fillStyle = '#9c8a6a';
+      ctx.beginPath();
+      ctx.arc(fx + (fx < cx ? -1 : 1) * a * 18 * S, gy - 4 - a * 10 * S, (3 + a * 5) * S, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1;
 
-  // Energiekreis: Bogen = Energie, dünner Außenring = durchgehaltene Zeit
-  const r = 88 + c.pulse * 5;
+  // Figur (blickt nach rechts), stemmt sich mit dem ganzen Körper gegen die Säge
+  const px = cx - 44 * S;
+  limb(px - 6 * S, gy - 34 * S, px - 34 * S, gy - 2, 7 * S, '#3b4a78'); // hinteres Bein, gestreckt
+  limb(px + 2 * S, gy - 34 * S, px + 14 * S, gy - 18 * S, 7 * S, '#3b4a78'); // vorderes Bein, gebeugt
+  limb(px + 14 * S, gy - 18 * S, px + 10 * S, gy - 2, 7 * S, '#3b4a78');
+  ctx.fillStyle = '#8a5a2b';
+  ctx.beginPath();
+  ctx.rect(px - 22 * S, gy - 70 * S, 12 * S, 24 * S);
+  ctx.fill();
+  inkStroke(2);
+  ctx.save();
+  ctx.translate(px, gy - 50 * S);
+  ctx.rotate(0.4);
+  ctx.fillStyle = '#2fd0c0';
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 13 * S, 21 * S, 0, 0, Math.PI * 2);
+  ctx.fill();
+  inkStroke(2.5);
+  ctx.restore();
+  limb(px + 4 * S, gy - 62 * S, cx - 12 * S, sy - 3 * S, 6 * S, '#2fd0c0');
+  limb(px + 8 * S, gy - 58 * S, cx - 10 * S, sy + 5 * S, 6 * S, '#2fd0c0');
+  ctx.fillStyle = '#ffd23f';
+  ctx.beginPath();
+  ctx.arc(px + 12 * S, gy - 78 * S, 11 * S, 0, Math.PI * 2);
+  ctx.fill();
+  inkStroke(2.5);
+  ctx.fillStyle = INK;
+  ctx.fillRect(px + 15 * S, gy - 82 * S, 8 * S, 4 * S);
+
+  // Dämon (blickt nach links), drückt mit Maul und Pranke dagegen
+  const mx = cx + 56 * S;
+  const my = gy - 64 * S;
+  const R = 38 * S;
+  limb(mx + 4 * S, gy - 32 * S, mx + 34 * S, gy - 2, 9 * S, '#b52a3c');
+  limb(mx - 8 * S, gy - 32 * S, mx - 14 * S, gy - 2, 9 * S, '#b52a3c');
+  ctx.fillStyle = BONE;
+  for (const hx of [-6, 14]) {
+    ctx.beginPath();
+    ctx.moveTo(mx + (hx - 8) * S, my - R + 8 * S);
+    ctx.quadraticCurveTo(mx + (hx + 4) * S, my - R - 26 * S, mx + (hx + 22) * S, my - R - 34 * S);
+    ctx.quadraticCurveTo(mx + (hx + 10) * S, my - R - 12 * S, mx + (hx + 8) * S, my - R + 10 * S);
+    ctx.closePath();
+    ctx.fill();
+    inkStroke(2);
+  }
+  ctx.fillStyle = '#e0364a';
+  ctx.beginPath();
+  ctx.arc(mx, my, R, 0, Math.PI * 2);
+  ctx.fill();
+  inkStroke(3);
+  ctx.fillStyle = 'rgba(26,15,28,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(mx + 6 * S, my + 14 * S, R * 0.6, R * 0.45, 0, 0, Math.PI * 2);
+  ctx.fill();
+  // offenes Maul nach links, Zähne um die Säge
+  const open = (10 + (1 - e) * 8) * S;
+  ctx.fillStyle = '#2a0a10';
+  ctx.beginPath();
+  ctx.moveTo(mx - R + 2, my - open + 6 * S);
+  ctx.lineTo(mx - 6 * S, my + 4 * S);
+  ctx.lineTo(mx - R + 2, my + open + 10 * S);
+  ctx.closePath();
+  ctx.fill();
+  inkStroke(2);
+  ctx.fillStyle = '#ffffff';
+  for (let k = 0; k < 3; k++) {
+    const tx = mx - R + 6 * S + k * 9 * S;
+    ctx.beginPath();
+    ctx.moveTo(tx, my - open + 7 * S + k * 3 * S);
+    ctx.lineTo(tx + 6 * S, my - open + 9 * S + k * 3 * S);
+    ctx.lineTo(tx + 2 * S, my - open + 17 * S + k * 3 * S);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(tx, my + open + 9 * S - k * 3 * S);
+    ctx.lineTo(tx + 6 * S, my + open + 7 * S - k * 3 * S);
+    ctx.lineTo(tx + 2 * S, my + open - 1 * S - k * 3 * S);
+    ctx.closePath();
+    ctx.fill();
+  }
+  // Auge mit Braue
+  ctx.fillStyle = '#ffd23f';
+  ctx.beginPath();
+  ctx.ellipse(mx - 12 * S, my - 18 * S, 9 * S, 7 * S, -0.3, 0, Math.PI * 2);
+  ctx.fill();
+  inkStroke(1.5);
+  ctx.fillStyle = INK;
+  ctx.beginPath();
+  ctx.arc(mx - 16 * S, my - 17 * S, 3 * S, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(mx - 26 * S, my - 30 * S);
+  ctx.lineTo(mx - 2 * S, my - 24 * S);
+  inkStroke(4 * S);
+  // Pranke auf der Säge
+  limb(mx - 6 * S, my + 16 * S, cx + 12 * S, sy + 8 * S, 9 * S, '#b52a3c');
+  drawSaw(cx, sy, 15 * S, now / (50 + (1 - e) * 150));
+  ctx.fillStyle = BONE;
+  for (let k = 0; k < 3; k++) {
+    ctx.beginPath();
+    ctx.moveTo(cx + 8 * S, sy + (2 + k * 5) * S);
+    ctx.lineTo(cx + 2 * S, sy + (4 + k * 5) * S);
+    ctx.lineTo(cx + 8 * S, sy + (6 + k * 5) * S);
+    ctx.closePath();
+    ctx.fill();
+  }
+  // Funken an der Säge
+  for (let k = 0; k < 4; k++) {
+    const a = ((now / 120 + k * 0.25) % 1);
+    ctx.globalAlpha = 1 - a;
+    ctx.fillStyle = '#ffd23f';
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(k * 1.7 + now / 300) * a * 30 * S, sy - a * 26 * S, 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // Energiekreis mit Restzeit
+  const rcx = T.W / 2;
+  const rcy = top + fieldH - 52 * S;
+  const r = 34 * S + c.pulse * 3;
   const a0 = -Math.PI / 2;
   ctx.lineCap = 'butt';
   ctx.strokeStyle = INK;
-  ctx.lineWidth = 22;
+  ctx.lineWidth = 16;
   ctx.beginPath();
-  ctx.arc(cx, cy, r, 0, Math.PI * 2);
+  ctx.arc(rcx, rcy, r, 0, Math.PI * 2);
   ctx.stroke();
   ctx.strokeStyle = '#4a3b52';
-  ctx.lineWidth = 16;
+  ctx.lineWidth = 11;
   ctx.stroke();
   ctx.strokeStyle = col;
   ctx.beginPath();
-  ctx.arc(cx, cy, r, a0, a0 + e * Math.PI * 2);
+  ctx.arc(rcx, rcy, r, a0, a0 + e * Math.PI * 2);
   ctx.stroke();
   ctx.strokeStyle = '#ffffff';
   ctx.lineWidth = 3;
   ctx.beginPath();
-  ctx.arc(cx, cy, r + 17, a0, a0 + (c.t / T.clashTime) * Math.PI * 2);
+  ctx.arc(rcx, rcy, r + 12, a0, a0 + (c.t / T.clashTime) * Math.PI * 2);
   ctx.stroke();
+  comicText(Math.max(0, T.clashTime - c.t).toFixed(1), rcx, rcy + 8, 22 * S + 4, '#ffffff');
 
-  // Tauziehen: der Berührpunkt wandert mit der Energie
-  const px = cx + (e - 0.5) * 70;
-  const jx = rand(-1.5, 1.5);
-  ctx.fillStyle = '#2fd0c0';
-  ctx.beginPath();
-  ctx.arc(px - 14 + jx, cy - 36, 11, 0, Math.PI * 2);
-  ctx.fill();
-  inkStroke(2.5);
-  ctx.fillStyle = '#ffd23f';
-  ctx.beginPath();
-  ctx.arc(px - 14 + jx, cy - 36, 6, 0, Math.PI * 2);
-  ctx.fill();
-  inkStroke(2);
-  drawDemon(px + 15 + jx, cy - 36, 13, '#e0364a', '#ffd23f');
-
-  comicText(Math.max(0, T.clashTime - c.t).toFixed(1), cx, cy + 28, 40, '#ffffff');
-  comicText('Sekunden durchhalten', cx, cy + 48, 11, '#d9c9e2');
-  if (c.intro <= 0 && Math.floor(performance.now() / 180) % 2 === 0) {
-    comicText('FEUER schnell tippen!', cx, cy + 142, 19, '#ffd23f');
+  comicText('NAHKAMPF', T.W / 2, top + 34, c.intro > 0 ? 26 + c.intro * 30 : 26, BLOOD_HI);
+  if (c.intro <= 0 && Math.floor(now / 180) % 2 === 0) {
+    comicText('FEUER schnell tippen!', rcx, rcy - r - 22, 15, '#ffd23f');
   }
 }
 
@@ -2236,10 +2615,10 @@ function draw() {
     return;
   }
 
-  // Arena: Steinboden mit Fugen, dunkle Mauern
-  ctx.fillStyle = '#4b3b52';
+  // Arena: Welt 1 „Die Gruft" – Steinplatten mit Moos und Rissen, Mauern mit Fackeln
+  ctx.fillStyle = WORLD.floor;
   ctx.fillRect(0, 0, T.W, H);
-  ctx.strokeStyle = '#3f3147';
+  ctx.strokeStyle = WORLD.floorLine;
   ctx.lineWidth = 2;
   ctx.beginPath();
   for (let y = T.topY + 40; y < H; y += 40) { ctx.moveTo(0, y); ctx.lineTo(T.W, y); }
@@ -2247,6 +2626,25 @@ function draw() {
     for (let x = row % 2 === 0 ? 45 : 90; x < T.W; x += 90) { ctx.moveTo(x, y); ctx.lineTo(x, y + 40); }
   }
   ctx.stroke();
+  for (const d of floorDeco) {
+    if (d.kind === 0) {
+      ctx.fillStyle = WORLD.moss;
+      ctx.globalAlpha = 0.55;
+      ctx.beginPath();
+      ctx.ellipse(d.x, d.y, d.s, d.s * 0.6, d.a, 0, Math.PI * 2);
+      ctx.ellipse(d.x + d.s * 0.7, d.y + d.s * 0.3, d.s * 0.5, d.s * 0.35, d.a, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    } else {
+      ctx.strokeStyle = WORLD.floorLine;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(d.x, d.y);
+      ctx.lineTo(d.x + Math.cos(d.a) * d.s, d.y + Math.sin(d.a) * d.s);
+      ctx.lineTo(d.x + Math.cos(d.a + 0.6) * d.s * 1.6, d.y + Math.sin(d.a + 0.6) * d.s * 1.6);
+      ctx.stroke();
+    }
+  }
   // Blutflecken bleiben liegen
   ctx.fillStyle = BLOOD;
   ctx.globalAlpha = 0.85;
@@ -2261,27 +2659,71 @@ function draw() {
     ctx.fill();
   }
   ctx.globalAlpha = 1;
-  ctx.fillStyle = '#241628';
+  drawRat();
+  // Mauern: oben Ziegelmauer, an den Seiten schmale Mauerkanten
+  ctx.fillStyle = WORLD.wall;
   ctx.fillRect(0, 0, T.W, T.topY);
-  ctx.fillRect(0, T.topY, 4, H);
-  ctx.fillRect(T.W - 4, T.topY, 4, H);
+  ctx.fillRect(0, T.topY, 6, H);
+  ctx.fillRect(T.W - 6, T.topY, 6, H);
+  ctx.strokeStyle = WORLD.wallLine;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  for (let y = 12; y < T.topY; y += 12) { ctx.moveTo(0, y); ctx.lineTo(T.W, y); }
+  for (let y = 0, r = 0; y < T.topY; y += 12, r++) {
+    for (let x = r % 2 === 0 ? 14 : 34; x < T.W; x += 40) { ctx.moveTo(x, y); ctx.lineTo(x, y + 12); }
+  }
+  ctx.stroke();
   ctx.fillStyle = '#6d5a78';
   ctx.fillRect(0, T.topY - 2, T.W, 2);
+  // Fackeln an den Seitenwänden, flackernd, bei Wind geneigt
+  const now = performance.now() / 1000;
+  const lean = ambient?.kind === 'wind' ? ambientEnvelope() * 7 : 0;
+  for (const tch of torches) {
+    const fl = 0.85 + 0.15 * Math.sin(now * 11 + tch.ph) * Math.sin(now * 7.3 + tch.ph * 2);
+    const lightR = 80 * (0.97 + 0.03 * fl); // Lichtschein fast ruhig, nur die Flamme flackert
+    const glow = ctx.createRadialGradient(tch.x, tch.y, 4, tch.x, tch.y, lightR);
+    glow.addColorStop(0, 'rgba(255,170,60,0.22)');
+    glow.addColorStop(1, 'rgba(255,170,60,0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(tch.x - 85, tch.y - 85, 170, 170);
+    ctx.fillStyle = '#5a4030';
+    ctx.beginPath();
+    ctx.rect(tch.x - 3, tch.y, 6, 12);
+    ctx.fill();
+    inkStroke(1.5);
+    const fx = tch.x + lean;
+    ctx.fillStyle = '#ff5a1f';
+    ctx.beginPath();
+    ctx.moveTo(tch.x - 6, tch.y + 1);
+    ctx.quadraticCurveTo(fx - 7, tch.y - 10 * fl, fx, tch.y - 16 * fl);
+    ctx.quadraticCurveTo(fx + 7, tch.y - 10 * fl, tch.x + 6, tch.y + 1);
+    ctx.closePath();
+    ctx.fill();
+    inkStroke(1.5);
+    ctx.fillStyle = '#ffd23f';
+    ctx.beginPath();
+    ctx.ellipse(tch.x + lean * 0.5, tch.y - 5 * fl, 2.5, 5 * fl, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
 
-  // Deckungen: Betonklötze der Gegner, Holzbarrikaden des Spielers
+  // Deckungen: steinerne Sarkophage der Gegner, Schrottbarrikaden des Spielers
   covers.forEach((c, i) => {
     const mine = c.row >= 0;
     const docked = i === player.cover;
     const x0 = c.x - c.w / 2;
     const y0 = c.y - c.h / 2;
     if (c.dead) {
-      // Trümmer
-      ctx.fillStyle = '#5a3a1c';
+      // Schrotthaufen: Bleche und Bretter
       for (let k = 0; k < 5; k++) {
+        ctx.save();
+        ctx.translate(x0 + 6 + k * (c.w - 12) / 4, c.y + (k % 2 === 0 ? -2 : 3));
+        ctx.rotate((k - 2) * 0.5);
         ctx.beginPath();
-        ctx.arc(x0 + 6 + k * (c.w - 12) / 4, c.y + (k % 2 === 0 ? -2 : 3), 3 + (k % 3), 0, Math.PI * 2);
+        ctx.rect(-5, -2.5, 10, 5);
+        ctx.fillStyle = k % 2 === 0 ? '#8a96a3' : '#9c6a32';
         ctx.fill();
         inkStroke(1.5);
+        ctx.restore();
       }
       return;
     }
@@ -2294,28 +2736,61 @@ function draw() {
       ctx.fillStyle = '#ffd23f';
       ctx.fillRect(x0 - 4, y0 - 4, c.w + 8, c.h + 8);
     }
+    if (!mine) {
+      // Sarkophag: Steinsockel, Deckel mit Kreuz
+      ctx.beginPath();
+      ctx.rect(x0, y0, c.w, c.h);
+      ctx.fillStyle = '#6f6c80';
+      ctx.fill();
+      inkStroke(2.5);
+      ctx.beginPath();
+      ctx.rect(x0 + 4, y0 + 3, c.w - 8, c.h - 6);
+      ctx.fillStyle = '#9592a6';
+      ctx.fill();
+      inkStroke(1.5);
+      ctx.beginPath();
+      ctx.moveTo(c.x - 7, c.y);
+      ctx.lineTo(c.x + 7, c.y);
+      ctx.moveTo(c.x - 2, c.y - 4);
+      ctx.lineTo(c.x - 2, c.y + 4);
+      inkStroke(1.5);
+      return;
+    }
+    // Schrottbarrikade: Wellblech mit Rost und Nieten, Bretter an den Enden.
+    // Bei Schaden bröckelt sie von den Rändern zur Mitte hin.
     const frac = c.maxHp > 0 ? clamp(c.hp / c.maxHp, 0, 1) : 1;
     ctx.beginPath();
     ctx.rect(x0, y0, c.w, c.h);
-    ctx.fillStyle = mine ? '#5a3a1c' : '#9a96a8';
+    ctx.fillStyle = '#3a2c2a';
     ctx.fill();
-    if (mine) {
-      // heiles Holz schrumpft mit dem Schaden zur Mitte hin
+    const w = c.w * frac;
+    const l = c.x - w / 2;
+    ctx.fillStyle = '#8a96a3';
+    ctx.fillRect(l, y0, w, c.h);
+    ctx.strokeStyle = '#5f6b78';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let x = l + 4; x < l + w - 2; x += 5) { ctx.moveTo(x, y0 + 1); ctx.lineTo(x, y0 + c.h - 1); }
+    ctx.stroke();
+    ctx.fillStyle = '#a65a2a';
+    ctx.globalAlpha = 0.7;
+    ctx.fillRect(l + w * 0.55, y0 + c.h * 0.45, w * 0.25, c.h * 0.55);
+    ctx.globalAlpha = 1;
+    if (frac > 0.6) {
       ctx.fillStyle = '#c98a3c';
-      ctx.fillRect(c.x - (c.w / 2) * frac, y0, c.w * frac, c.h);
-      ctx.fillStyle = '#e3aa5c';
-      ctx.fillRect(c.x - (c.w / 2) * frac, y0, c.w * frac, c.h * 0.3);
-    } else {
-      ctx.fillStyle = '#bdb9c9';
-      ctx.fillRect(x0, y0, c.w, c.h * 0.35);
+      ctx.fillRect(x0 + 1, y0 - 2, 7, c.h + 4);
+      ctx.fillRect(x0 + c.w - 8, y0 - 2, 7, c.h + 4);
+    }
+    ctx.fillStyle = INK;
+    for (let x = l + 6; x < l + w - 4; x += 14) {
+      ctx.beginPath();
+      ctx.arc(x, y0 + 3, 1.2, 0, Math.PI * 2);
+      ctx.arc(x, y0 + c.h - 3, 1.2, 0, Math.PI * 2);
+      ctx.fill();
     }
     ctx.beginPath();
     ctx.rect(x0, y0, c.w, c.h);
     inkStroke(2.5);
-    // Planken bzw. Risse
-    ctx.beginPath();
-    for (let x = x0 + 15; x < x0 + c.w - 4; x += 15) { ctx.moveTo(x, y0); ctx.lineTo(x + (mine ? 0 : 3), y0 + c.h); }
-    inkStroke(1.2);
   });
 
   drawPortals();
@@ -2350,7 +2825,21 @@ function draw() {
     const near = Math.hypot(en.x - player.x, en.y - bodyY());
     const blink = en.kind === 'bomber' && Math.floor(performance.now() / (near < 140 ? 70 : 180)) % 2 === 0;
     const body = en.flash > 0 ? '#ffffff' : rush || blink ? '#ff8a1f' : KIND_COLOR[en.kind];
-    drawDemon(en.x, en.y, er, body, en.kind === 'sniper' ? BLOOD_HI : '#ffd23f', en.kind === 'tank' ? 1.4 : en.kind === 'sniper' ? 0.5 : 1);
+    const horn = en.kind === 'tank' ? 1.4 : en.kind === 'sniper' ? 0.5 : 1;
+    if (en.state === 'charge' && inCover(en.x, en.y, 6)) {
+      // springt über die Deckung: größer, mit Schatten darunter
+      ctx.fillStyle = 'rgba(12,6,14,0.4)';
+      ctx.beginPath();
+      ctx.ellipse(en.x, en.y + er, er, er * 0.4, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.save();
+      ctx.translate(en.x, en.y - 8);
+      ctx.scale(1.3, 1.3);
+      drawDemon(0, 0, er, body, '#ffd23f', horn);
+      ctx.restore();
+    } else {
+      drawDemon(en.x, en.y, er, body, en.kind === 'sniper' ? BLOOD_HI : '#ffd23f', horn);
+    }
     if (rush) comicText('!', en.x, en.y - er - 14, 20, '#ffd23f');
     hpBar(en.x, en.y - er - 9, er * 1.75, 3, en.hp / en.maxHp, BLOOD_HI);
   }
@@ -2444,7 +2933,7 @@ function draw() {
     ctx.stroke();
   }
   drawPlayer();
-  const hpFrac = player.hp / T.playerHp;
+  const hpFrac = player.hp / maxHp();
   hpBar(player.x, py + 28, 44, 4, hpFrac, hpFrac > 0.5 ? '#5dff8f' : hpFrac > 0.25 ? '#ffd23f' : BLOOD_HI);
 
   drawAim();
@@ -2488,6 +2977,14 @@ function draw() {
     ctx.fillRect(0, T.topY, T.W, H - T.ctrlH - T.topY);
   }
 
+  drawAmbientOverlay();
+  // Gruft-Stimmung: die Ränder des Feldes dunkeln ab
+  const vcy = T.topY + (H - T.ctrlH - T.topY) / 2;
+  const vg = ctx.createRadialGradient(T.W / 2, vcy, 120, T.W / 2, vcy, 430);
+  vg.addColorStop(0, 'rgba(12,6,14,0)');
+  vg.addColorStop(1, 'rgba(12,6,14,0.5)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, T.topY, T.W, H - T.ctrlH - T.topY);
   drawRepairPopup();
   drawControls();
 

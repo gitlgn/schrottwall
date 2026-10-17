@@ -164,6 +164,10 @@ const SFX: Record<string, (p: number) => void> = {
     noise('bandpass', 300, 1800, 0.55, 0.4, 0, sfxBus, 4);
     for (let i = 0; i < 4; i++) noise('highpass', 4000, 4000, 0.03, 0.2, 0.1 + i * 0.1 + Math.random() * 0.05);
   },
+  // Umgebung
+  wind: () => { noise('bandpass', 300, 900, 1.6, 0.25, 0, sfxBus, 2); noise('bandpass', 900, 400, 2.2, 0.18, 1.2, sfxBus, 2); },
+  squeak: () => { tone('sine', 2600, 3400, 0.05, 0.12); tone('sine', 2900, 3800, 0.06, 0.1, 0.09); },
+  chain: () => { for (let i = 0; i < 5; i++) tone('square', 2200 + Math.random() * 900, 1800, 0.025, 0.07, i * 0.045); },
   // Hitze
   overheat: () => { noise('highpass', 3000, 1500, 0.9, 0.35); tone('sawtooth', 400, 150, 0.25, 0.15); },
   cooled: () => { tone('triangle', 1200, 1600, 0.08, 0.14); },
